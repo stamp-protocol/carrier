@@ -1,0 +1,12 @@
+[package]
+name = "carrier"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+getset = "0.1"
+rand = { version = "0.8", features = ["getrandom"] }
+rasn = "0.20"
+stamp-core = { path = "../../core" }
+thiserror = "1.0"
