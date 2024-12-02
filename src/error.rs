@@ -15,6 +15,14 @@ pub enum Error {
     #[error("key packet tampered with")]
     KeyPacketTampered,
 
+    /// A snapshot failed to generate
+    #[error("snapshot failed (did you pass a valid replacement id?)")]
+    SnapshotFailed,
+
+    /// A snapshot has been tampered with
+    #[error("snapshot tampered with")]
+    SnapshotTampered,
+
     /// An error occured in the Stamp protocol itself
     #[error("stamp error: {0}")]
     Stamp(#[from] stamp_core::error::Error),
