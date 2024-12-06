@@ -2,6 +2,21 @@
 
 A topic-based intra-or-inter-identity messaging system based on Stamp identities.
 
+## Progress
+
+- [ ] each time a new transaction is added, re-order and re-build the topic state
+
+ - store leaf txids in Topic so it knows where it left off?? (ie, save state as we go along)
+ - order() should return ALL transactions? or at least be named properly
+ - some way to push a transaction, efficiently build the topic state from it
+   - this could be used when bootstrapping, ingesting a remote transaction, or
+     creating a new one locally.
+   - apply_tx() works great at comparing to the current state, but the current
+     state isn't always complete so we need to make sure we apply a tx based on
+     the state of the previous transactions and nothing else. if possible, we
+     find some way of detecting malicious forks, but that's secondary since this
+     is mostly a protocol for mostly trusted nodes, mostly.
+
 ## Architecture
 
 ### Full and relay members

@@ -6,38 +6,73 @@ use crate::error::{Error, Result};
 use getset;
 use rasn::{AsnType, Decode, Encode};
 use stamp_core::{
-    crypto::{
-        base::{
-            rng::{CryptoRng, RngCore},
-            CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Hmac, HmacKey, Sealed, SecretKey, SignKeypair, SignKeypairPublic,
-            SignKeypairSignature,
-        },
-        message::Message,
+    crypto::base::{
+        rng::{CryptoRng, RngCore},
+        CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature,
     },
-    dag::{Dag, DagNode, Transaction, TransactionBody, TransactionEntry, TransactionID, Transactions},
+    dag::{Dag, DagNode, Transaction, TransactionBody, TransactionID, Transactions},
     identity::{keychain::AdminKey, IdentityID},
-    util::{base64_encode, Binary, BinarySecret, SerdeBinary, Timestamp},
+    util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 /// Defines a permission a member can have within a group.
-#[derive(Clone, Debug, AsnType, Encode, Decode)]
+#[derive(Clone, Debug, PartialEq, AsnType, Encode, Decode)]
 #[rasn(choice)]
 pub enum Permission {
-    /// Allows changing member's permissions
+    /// Allows creating new data on the topic.
     #[rasn(tag(explicit(0)))]
-    MemberChangePermissions,
+    DataSet,
     /// Allows marking old packets as deleted. This doesn't fully remove the packet (as this might
     /// break the DAG chain), but does wipe out its data.
     #[rasn(tag(explicit(1)))]
-    PacketDelete,
-    /// Allows publishing messages on the topic
+    DataUnset,
+    /// Allows a member to change devices in their own profile.
     #[rasn(tag(explicit(2)))]
-    TopicPublish,
-    /// Allows re-keying the topic without modifying membership
+    MemberDevicesUpdate,
+    /// Allows changing member's permissions
     #[rasn(tag(explicit(3)))]
+    MemberPermissionsChange,
+    /// Allows re-keying the topic
+    #[rasn(tag(explicit(4)))]
     TopicRekey,
+}
+
+/// Represents a unique ID for a member device. Randomly generated.
+#[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, Hash)]
+#[rasn(delegate)]
+pub struct DeviceID(Binary<16>);
+
+impl DeviceID {
+    /// Create a new random TopicID.
+    pub fn new<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+        let mut randbuf = [0u8; 16];
+        rng.fill_bytes(&mut randbuf);
+        Self(Binary::new(randbuf))
+    }
+}
+
+impl SerdeBinary for DeviceID {}
+
+/// Represent's a member's device.
+#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
+#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
+pub struct Device {
+    /// The device's unique ID
+    #[rasn(tag(explicit(0)))]
+    id: DeviceID,
+    /// The device's member-supplied name
+    #[rasn(tag(explicit(1)))]
+    name: String,
+}
+
+impl Device {
+    /// Create a new random TopicID.
+    pub fn new<R: RngCore + CryptoRng>(rng: &mut R, name: String) -> Self {
+        let id = DeviceID::new(rng);
+        Self { id, name }
+    }
 }
 
 /// Information on a member of a topic.
@@ -50,6 +85,20 @@ pub struct Member {
     /// An additive list of permissions this member can perform on the topic
     #[rasn(tag(explicit(1)))]
     permissions: Vec<Permission>,
+    /// A list of this member's devices.
+    #[rasn(tag(explicit(2)))]
+    devices: Vec<Device>,
+}
+
+impl Member {
+    /// Create a new member object.
+    pub fn new(identity_id: IdentityID, permissions: Vec<Permission>, devices: Vec<Device>) -> Self {
+        Self {
+            identity_id,
+            permissions,
+            devices,
+        }
+    }
 }
 
 /// A topic's secret seed.
@@ -105,13 +154,16 @@ impl SecretEntry {
 
 impl SerdeBinary for SecretEntry {}
 
-/// Holds information about a cryptographic encryption key.
+/// Holds information about a public cryptographic encryption key.
 #[derive(Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct KeyPacketEntry {
     /// The identity id that owns the included public key
     #[rasn(tag(explicit(0)))]
     identity_id: IdentityID,
+    /// The device this key packet was generated from/for.
+    #[rasn(tag(explicit(1)))]
+    device_id: DeviceID,
     /// The cryptographic public key we're advertising others to use to send us messages.
     #[rasn(tag(explicit(1)))]
     pubkey: CryptoKeypairPublic,
@@ -141,8 +193,18 @@ pub struct KeyPacket {
 impl KeyPacket {
     /// Create a new key packet, advertising a public crypto key we own that's signed with our
     /// signing keypair (so others can verify it is actually owned by us).
-    pub fn new(master_key: &SecretKey, sign_keypair: &SignKeypair, identity_id: IdentityID, pubkey: CryptoKeypairPublic) -> Result<Self> {
-        let entry = KeyPacketEntry { identity_id, pubkey };
+    pub fn new(
+        master_key: &SecretKey,
+        sign_keypair: &SignKeypair,
+        identity_id: IdentityID,
+        device_id: DeviceID,
+        pubkey: CryptoKeypairPublic,
+    ) -> Result<Self> {
+        let entry = KeyPacketEntry {
+            identity_id,
+            device_id,
+            pubkey,
+        };
         let entry_ser = entry.serialize_binary()?;
         let id = Hash::new_blake3(&entry_ser[..])?;
         let id_ser = id.serialize_binary()?;
@@ -164,19 +226,41 @@ impl KeyPacket {
     }
 }
 
+/// A message sent to a member containing a topic secret.
+#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
+#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
+struct RekeyMessage {
+    /// The key we're using to encrypt the message
+    #[rasn(tag(explicit(0)))]
+    to_key: CryptoKeypairPublic,
+    /// The encrypted message
+    #[rasn(tag(explicit(1)))]
+    message: BinaryVec,
+}
+
+impl RekeyMessage {
+    /// Create a new `RekeyMessage`.
+    pub fn new(to_key: CryptoKeypairPublic, message: Vec<u8>) -> Self {
+        Self {
+            to_key,
+            message: message.into(),
+        }
+    }
+}
+
 /// A member re-key entry, allowing an existing member of a topic to get a new shared secret, or
 /// allowing a new member to be initiated into the topic via a collection of past shared secrets
 /// (along with the latest secret).
 #[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct MemberRekey {
-    /// The member's Stamp id
+    /// The full member object
     #[rasn(tag(explicit(0)))]
-    identity_id: IdentityID,
+    member: Member,
     /// Any secret(s) this member needs to read the topic's data, encrypted with the member's
     /// public sync key.
     #[rasn(tag(explicit(1)))]
-    secrets: Vec<Message>,
+    secrets: HashMapAsn1<DeviceID, RekeyMessage>,
 }
 
 impl MemberRekey {
@@ -184,37 +268,51 @@ impl MemberRekey {
     /// syncing cryptographic public key.
     pub fn seal<R: RngCore + CryptoRng>(
         rng: &mut R,
-        recipient_crypto_pubkey: &CryptoKeypairPublic,
-        identity_id: IdentityID,
-        secrets: &Vec<SecretEntry>,
+        member: Member,
+        recipient_crypto_pubkeys: &HashMap<&DeviceID, &CryptoKeypairPublic>,
+        secrets: Vec<SecretEntry>,
     ) -> Result<Self> {
-        let secrets = secrets
+        let secret_ser = secrets.serialize_binary()?;
+        let secrets = recipient_crypto_pubkeys
             .iter()
-            .map(|entry| {
-                let ser = entry.serialize_binary()?;
-                let enc = recipient_crypto_pubkey.seal_anonymous(rng, &ser[..]).map_err(|e| Error::Stamp(e))?;
-                Ok(Message::Anonymous(enc.into()))
+            .map(|(device_id, crypto_pubkey)| {
+                let enc = crypto_pubkey.seal_anonymous(rng, &secret_ser[..]).map_err(|e| Error::Stamp(e))?;
+                #[allow(suspicious_double_ref_op)]
+                let msg = RekeyMessage::new(crypto_pubkey.clone().clone(), enc);
+                #[allow(suspicious_double_ref_op)]
+                Ok((device_id.clone().clone(), msg))
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { identity_id, secrets })
+            .collect::<Result<HashMap<_, _>>>()?
+            .into();
+        Ok(Self { member, secrets })
     }
 
     /// Open a rekey entry given the proper crypto secret key and master key.
-    pub fn open(&self, recipient_master_key: &SecretKey, recipient_crypto_keypair: &CryptoKeypair) -> Result<Vec<SecretEntry>> {
-        let entries = self
-            .secrets
+    pub fn open(
+        self,
+        recipient_master_key: &SecretKey,
+        recipient_crypto_keypairs: &[&CryptoKeypair],
+        our_device_id: &DeviceID,
+        transaction_id: &TransactionID,
+    ) -> Result<(Member, Vec<SecretEntry>)> {
+        let msg = self
+            .secrets()
+            .get(our_device_id)
+            .ok_or_else(|| Error::MemberMissingDevice(our_device_id.clone()))?;
+        let enc = msg.message().deref();
+        let dec = recipient_crypto_keypairs
             .iter()
-            .map(|msg| {
-                let enc = match msg {
-                    Message::Anonymous(enc) => enc,
-                    _ => Err(Error::PacketInvalid)?,
-                };
-                let dec = recipient_crypto_keypair.open_anonymous(recipient_master_key, &enc[..])?;
-                let entry = SecretEntry::deserialize_binary(&dec[..])?;
-                Ok(entry)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(entries)
+            .find_map(|crypto| crypto.open_anonymous(recipient_master_key, &enc[..]).ok())
+            .ok_or_else(|| Error::MemberRekeyOpenFailed(transaction_id.clone(), our_device_id.clone()))?;
+        let entries: Vec<SecretEntry> = SerdeBinary::deserialize_binary(&dec[..])?;
+        let Self { member, .. } = self;
+        Ok((member, entries))
+    }
+
+    /// Consumes this member rekey object, returning the member.
+    pub fn consume(self) -> Member {
+        let Self { member, .. } = self;
+        member
     }
 }
 
@@ -242,9 +340,18 @@ pub enum Packet {
         #[rasn(tag(explicit(0)))]
         transaction_ids: Vec<TransactionID>,
     },
-    /// Changes a member's permissions
+    /// Allows a member to add/remove devices to their own profile. We omit the identity id of the
+    /// member being modified because members can only update their own devices with this
+    /// permission, so the identity id is stored in the transaction carrying the packet.
     #[rasn(tag(explicit(2)))]
-    MemberChangePermissions {
+    MemberDevicesUpdate {
+        /// The member's device list
+        #[rasn(tag(explicit(0)))]
+        devices: Vec<Device>,
+    },
+    /// Changes a member's permissions
+    #[rasn(tag(explicit(3)))]
+    MemberPermissionsChange {
         /// The identity ID of the member we're editing
         #[rasn(tag(explicit(0)))]
         identity_id: IdentityID,
@@ -254,7 +361,7 @@ pub enum Packet {
     },
     /// Re-keys a topic, assigning a new topic key for future packets and potentially changing
     /// membership (adding/removing members).
-    #[rasn(tag(explicit(3)))]
+    #[rasn(tag(explicit(4)))]
     TopicRekey {
         /// The new member list of this topic, complete with the secret(s) required to decrypt
         /// the data in the topic, encrypted for each member individually via their public sync
@@ -443,19 +550,27 @@ impl TopicTransaction {
                 let packet = Packet::deserialize_binary(payload.deref())?;
                 Ok(packet)
             }
-            _ => Err(Error::PacketInvalid)?,
+            _ => Err(Error::PacketInvalid(self.id().clone()))?,
+        }
+    }
+
+    /// Returns the identity id of this transaction.
+    pub fn identity_id(&self) -> Result<&IdentityID> {
+        match self.transaction().entry().body() {
+            TransactionBody::ExtV1 { ref creator, .. } => Ok(creator),
+            _ => Err(Error::PacketInvalid(self.id().clone()))?,
         }
     }
 
     /// Return the transactions that came before this one within the topic DAG. In other words, we
     /// don't use `transaction.entry().previous_transactions()` but rather
     /// `transaction.entry().body::<ExtV1>().previous_transactions()`.
-    pub fn previous_transactions(&self) -> Vec<&TransactionID> {
+    pub fn previous_transactions(&self) -> Result<Vec<&TransactionID>> {
         match self.transaction().entry().body() {
             TransactionBody::ExtV1 {
                 ref previous_transactions, ..
-            } => previous_transactions.iter().collect::<Vec<_>>(),
-            _ => Vec::new(),
+            } => Ok(previous_transactions.iter().collect::<Vec<_>>()),
+            _ => Err(Error::PacketInvalid(self.id().clone()))?,
         }
     }
 
@@ -466,7 +581,7 @@ impl TopicTransaction {
                 let packet = Packet::deserialize_binary(payload.as_slice())?;
                 Ok(matches!(packet, Packet::DataUnset { .. }))
             }
-            _ => Err(Error::PacketInvalid)?,
+            _ => Err(Error::PacketInvalid(self.id().clone()))?,
         }
     }
 
@@ -480,14 +595,14 @@ impl TopicTransaction {
                     _ => Ok(Vec::new()),
                 }
             }
-            _ => Err(Error::PacketInvalid)?,
+            _ => Err(Error::PacketInvalid(self.id().clone()))?,
         }
     }
 }
 
 impl<'a> From<&'a TopicTransaction> for DagNode<'a, TransactionID, TopicTransaction> {
     fn from(t: &'a TopicTransaction) -> Self {
-        DagNode::new(t.id(), t, t.previous_transactions(), t.timestamp())
+        DagNode::new(t.id(), t, t.previous_transactions().unwrap_or_else(|_| Vec::new()), t.timestamp())
     }
 }
 
@@ -532,8 +647,6 @@ pub struct Topic {
     transactions: Vec<TopicTransaction>,
 }
 
-// TODO:
-// - don't allow Unset on non-data packets
 impl Topic {
     /// Create a new empty `Topic` object.
     pub fn new() -> Self {
@@ -552,16 +665,207 @@ impl Topic {
     /// uses our crypto keypairs to decrypt any topic secrets in the control packets. This allows
     /// us to full build our topic state.
     pub fn new_from_transactions(
-        transactions: Vec<TopicTransaction>,
-        identities: &[&Transactions],
+        transactions: &[TopicTransaction],
+        identities: &HashMap<IdentityID, &Transactions>,
+        our_master_key: &SecretKey,
         our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
     ) -> Result<Self> {
         let mut topic = Self::new();
-        topic.set_transactions(transactions);
-        for tx in topic.order()? {
-            let packet = tx.get_packet();
-        }
+        topic.push_transactions(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
         Ok(topic)
+    }
+
+    /// Check if the permissions on a transaction are valid.
+    pub fn check_permissions(&self, permission: Permission, identity_id: &IdentityID, transaction_id: &TransactionID) -> Result<()> {
+        let member = self
+            .members()
+            .get(identity_id)
+            .ok_or_else(|| Error::PermissionCheckFailed(transaction_id.clone(), permission.clone()))?;
+        if !member.permissions().contains(&permission) {
+            Err(Error::PermissionCheckFailed(transaction_id.clone(), permission))?;
+        }
+        Ok(())
+    }
+
+    /// Allows staging a transaction (adding it to a clone of our current accepted transaction list
+    /// and aplying its changes to see if they're valid). If everything checks out, we return a new
+    /// topic with all transactions (including the pushed one) run in-order and the state
+    /// reflecting these transactions.
+    pub fn push_transactions(
+        &mut self,
+        transactions: &[TopicTransaction],
+        identities: &HashMap<IdentityID, &Transactions>,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<bool> {
+        let nodes_old = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
+        let nodes_new = transactions.iter().map(|x| x.into()).collect::<Vec<_>>();
+
+        // verify our transactions against their respective identities
+        for trans in transactions {
+            let trans_identity_id = trans.identity_id()?;
+            let prev = trans.transaction().entry().previous_transactions();
+            let identity_tx = identities
+                .get(trans_identity_id)
+                .ok_or_else(|| Error::IdentityMissing(trans_identity_id.clone()))?;
+            let identity = identity_tx.build_identity_at_point_in_history(&prev)?;
+            trans.transaction().verify(Some(&identity))?;
+        }
+
+        let visited: Vec<&TopicTransaction> = {
+            let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_old, &nodes_new]);
+            if dag.missing().len() > 0 {
+                Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
+            }
+            dag.visited()
+                .iter()
+                .map(|tid| {
+                    #[allow(suspicious_double_ref_op)]
+                    dag.index()
+                        .get(tid)
+                        .map(|t| *t.node())
+                        .ok_or_else(|| Error::TopicMissingTransactions(vec![tid.clone().clone()]))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut found_control = false;
+        let transactions_since_last_control = self
+            .transactions()
+            .iter()
+            .rev()
+            .filter(|trans| {
+                let last_found_control = found_control;
+                if let Ok(packet) = trans.get_packet() {
+                    match packet {
+                        Packet::MemberDevicesUpdate { .. } | Packet::MemberPermissionsChange { .. } | Packet::TopicRekey { .. } => {
+                            found_control = true;
+                        }
+                        Packet::DataSet { .. } | Packet::DataUnset { .. } => {}
+                    }
+                }
+                !last_found_control
+            })
+            .map(|t| t.id())
+            .collect::<HashSet<_>>();
+        let new_nodes_id_set = nodes_new.iter().map(|t| t.id()).collect::<HashSet<_>>();
+        let new_nodes_prev_list = nodes_new
+            .iter()
+            .map(|t| t.node().previous_transactions().unwrap_or_else(|_| Vec::new()))
+            .fold(Vec::new(), |mut acc, mut x| {
+                acc.append(&mut x);
+                acc
+            });
+        let mut new_nodes_only_reference_nodes_since_latest_control = true;
+        for prev in new_nodes_prev_list {
+            if !transactions_since_last_control.contains(prev) {
+                new_nodes_only_reference_nodes_since_latest_control = false;
+                break;
+            }
+        }
+        // if our new nodes only reference nodes since the last control, we can happily just run
+        // them on top of our current topic state.
+        //
+        // if our new nodes reference transactions BEFORE the latest control packet, we've got to
+        // rebuild our entire state from the beginning.
+        let apply = if new_nodes_only_reference_nodes_since_latest_control {
+            let mut apply = Vec::with_capacity(nodes_new.len());
+            for trans in visited {
+                if new_nodes_id_set.contains(&trans.id()) {
+                    apply.push(trans.clone());
+                }
+            }
+            apply
+        } else {
+            visited.iter().cloned().cloned().collect::<Vec<_>>()
+        };
+        for trans in apply {
+            self.apply_transaction(trans, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
+        }
+        Ok(new_nodes_only_reference_nodes_since_latest_control)
+    }
+
+    /// Push a new [`TopicTransaction`] into this topic.
+    fn apply_transaction<'a>(
+        &'a mut self,
+        transaction: TopicTransaction,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<&TopicTransaction> {
+        let is_initial_packet = self.transactions().len() == 0;
+
+        let packet = transaction.get_packet()?;
+        let identity_id = transaction.identity_id()?;
+        match packet {
+            Packet::DataSet { .. } => {
+                self.check_permissions(Permission::DataSet, &identity_id, transaction.id())?;
+            }
+            Packet::DataUnset { .. } => {
+                self.check_permissions(Permission::DataUnset, &identity_id, transaction.id())?;
+                // TODO:
+                // - don't allow Unset on non-data packets
+            }
+            Packet::MemberDevicesUpdate { devices } => {
+                self.check_permissions(Permission::MemberDevicesUpdate, &identity_id, transaction.id())?;
+                self.members_mut()
+                    .get_mut(identity_id)
+                    .map(|member| {
+                        member.set_devices(devices);
+                    })
+                    .ok_or_else(|| Error::MemberNotFound(identity_id.clone()))?;
+            }
+            Packet::MemberPermissionsChange {
+                identity_id: identity_id_changee,
+                permissions: new_permissions,
+            } => {
+                self.check_permissions(Permission::MemberPermissionsChange, &identity_id, transaction.id())?;
+                if !self.members().contains_key(&identity_id_changee) {
+                    Err(Error::MemberNotFound(identity_id_changee.clone()))?;
+                }
+                let initiator_permissions = self
+                    .members()
+                    .get(identity_id)
+                    .ok_or_else(|| Error::MemberNotFound(identity_id.clone()))?
+                    .permissions();
+                for new_permission in &new_permissions {
+                    if !initiator_permissions.contains(new_permission) {
+                        Err(Error::PermissionChangeFailed(identity_id.clone(), new_permission.clone()))?;
+                    }
+                }
+                self.members_mut()
+                    .get_mut(&identity_id_changee)
+                    .map(|member| member.set_permissions(new_permissions))
+                    .ok_or_else(|| Error::MemberNotFound(identity_id_changee))?;
+            }
+            Packet::TopicRekey { members } => {
+                if !is_initial_packet {
+                    self.check_permissions(Permission::TopicRekey, &identity_id, transaction.id())?;
+                }
+                // every rekey necessarily rebuilds the entire member set
+                self.members_mut().clear();
+                for member_rekey in members {
+                    let member = if member_rekey.member().identity_id() == our_identity_id {
+                        let (member, secrets) = member_rekey.open(our_master_key, our_crypto_keypairs, our_device_id, transaction.id())?;
+                        for secret in secrets {
+                            self.keychain_mut()
+                                .insert(transaction.id().clone(), secret.secret().derive_secret_key()?);
+                            self.secrets_mut().push(secret);
+                        }
+                        member
+                    } else {
+                        member_rekey.consume()
+                    };
+                    self.members.insert(member.identity_id().clone(), member);
+                }
+            }
+        }
+        self.transactions_mut().push(transaction);
+        Ok(self.transactions().last().unwrap())
     }
 
     /// Find operations that are not referenced in any other operation's `previous` list.
@@ -584,10 +888,13 @@ impl Topic {
     }
 
     /// Create and push a transaction into this topic
-    pub fn push_transaction<T: Into<Timestamp> + Clone>(
+    pub fn create_and_apply_transaction<T: Into<Timestamp> + Clone>(
         &mut self,
         master_key: &SecretKey,
         admin_key: &AdminKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
         transactions: &Transactions,
         hash_with: &HashAlgo,
         now: T,
@@ -608,8 +915,8 @@ impl Topic {
                 packet_ser.into(),
             )?
             .sign(master_key, admin_key)?;
-        self.transactions_mut().push(TopicTransaction::new(trans));
-        Ok(self.transactions().last().unwrap())
+        let transaction = TopicTransaction::new(trans);
+        self.apply_transaction(transaction, master_key, our_crypto_keypairs, our_identity_id, our_device_id)
     }
 
     /*
@@ -631,9 +938,9 @@ impl Topic {
     /// Return this operation set as a [`Dag`], which provides information on the structure of the
     /// DAG itself (missing nodes, unvisited/unreachable nodes) and also allows
     /// [walking][Dag::walk].
-    pub fn as_dag<'a>(&'a self) -> Dag<'a, TransactionID, TopicTransaction> {
-        let nodes = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
-        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&nodes);
+    pub fn as_dag<'a>(transactions: &'a [TopicTransaction]) -> Dag<'a, TransactionID, TopicTransaction> {
+        let nodes = transactions.iter().map(|x| x.into()).collect::<Vec<_>>();
+        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes]);
         dag
     }
 
@@ -751,9 +1058,17 @@ impl Topic {
         }
 
         let nodes = transactions_clone.iter().map(|x| x.into()).collect::<Vec<_>>();
-        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&nodes);
+        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes]);
+        if dag.missing().len() > 0 {
+            Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
+        }
         let mut output: Vec<&'a TopicTransaction> = Vec::with_capacity(self.transactions().len() - unsets.len());
-        dag.walk(|node, _, _| {
+        for node_id in dag.visited() {
+            #[allow(suspicious_double_ref_op)]
+            let node = dag
+                .index()
+                .get(node_id)
+                .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
             if !node.node().is_unset()? && !unsets.contains(node.node().id()) {
                 // NOTE: we can't push `node.node()` directly here because it's a clone of our
                 // original list, so instead we pull from our dumb tx index.
@@ -761,8 +1076,7 @@ impl Topic {
                     output.push(tx);
                 }
             }
-            Ok::<(), Error>(())
-        })?;
+        }
         Ok(output)
     }
 
@@ -807,7 +1121,7 @@ impl Topic {
                 Some(x) => x,
                 None => continue,
             };
-            for prev in tx.previous_transactions() {
+            for prev in tx.previous_transactions()? {
                 walk_queue.push_back(prev);
             }
         }
@@ -828,14 +1142,19 @@ impl Topic {
         }
 
         let nodes = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
-        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&nodes);
+        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes]);
 
         // this list will replace `self.operations`
         let mut final_nodes: Vec<TopicTransaction> = Vec::with_capacity(self.transactions().len());
         // this is our final snapshot list
         let mut snapshot_ordered_operations: Vec<SnapshotOrderedOp> = Vec::new();
         let mut found_replacement_node = false;
-        dag.walk(|node, _ancestry, _branch_tracker| {
+        for node_id in dag.visited() {
+            #[allow(suspicious_double_ref_op)]
+            let node = dag
+                .index()
+                .get(node_id)
+                .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
             #[allow(suspicious_double_ref_op)]
             let mut tx: TopicTransaction = node.node().clone().clone();
             if !found_replacement_node {
@@ -893,9 +1212,7 @@ impl Topic {
                 found_replacement_node = true;
                 final_nodes.push(tx.clone());
             }
-
-            Ok::<(), Error>(())
-        })?;
+        }
         if !found_replacement_node {
             Err(Error::SnapshotFailed)?;
         }
@@ -907,7 +1224,6 @@ impl Topic {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::error::Error;
     use stamp_core::{
         crypto::base::{
             rng::{self, ChaCha20Rng, CryptoRng, RngCore},
@@ -1024,14 +1340,17 @@ pub(crate) mod tests {
         admin_key: &AdminKey,
         identity: &Transactions,
         crypto_key: &CryptoKeypair,
+        device_id: &DeviceID,
         transactions: Vec<Transaction>,
     ) -> Topic {
+        let identity_id = identity.identity_id().unwrap();
         let transactions = transactions
             .into_iter()
             .map(|t| t.sign(master_key, admin_key).unwrap())
             .map(|t| TopicTransaction::new(t))
             .collect::<Vec<_>>();
-        Topic::new_from_transactions(transactions, &[&identity], &[&crypto_key]).unwrap()
+        let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
+        Topic::new_from_transactions(&transactions[..], &identity_map, master_key, &[&crypto_key], &identity_id, device_id).unwrap()
     }
 
     /*
@@ -1088,6 +1407,7 @@ pub(crate) mod tests {
         let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, Timestamp::from_str("2024-01-01T00:00:06Z").unwrap());
         let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
         let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
+        let node_a_device_id = DeviceID::new(&mut rng);
 
         let topic_id = TopicID::new(&mut rng);
         let topic_key = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
@@ -1096,11 +1416,23 @@ pub(crate) mod tests {
 
         let mut pkt = PacketGen::new(&mut rng, &transactions, &topic_id, &topic_seckey);
 
+        let member = Member::new(
+            transactions.identity_id().unwrap(),
+            vec![
+                Permission::DataSet,
+                Permission::DataUnset,
+                Permission::MemberDevicesUpdate,
+                Permission::MemberPermissionsChange,
+                Permission::TopicRekey,
+            ],
+            vec![Device::new(&mut rng, "laptop".into())],
+        );
+
         let node_a_member = MemberRekey::seal(
             &mut rng,
-            &node_a_sync_crypto.clone().into(),
-            transactions.identity_id().unwrap(),
-            &vec![SecretEntry::new_current_transaction(topic_secret.clone())],
+            member.clone(),
+            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
 
@@ -1122,7 +1454,7 @@ pub(crate) mod tests {
                 [D, F] <- [G],
             ],
         };
-        let topic = create_1p_topic(&master_key, &admin_key, &transactions, &node_a_sync_crypto, topic_tx);
+        let topic = create_1p_topic(&master_key, &admin_key, &transactions, &node_a_sync_crypto, member.devices()[0].id(), topic_tx);
         let ordered = topic
             .order()
             .unwrap()
@@ -1134,6 +1466,11 @@ pub(crate) mod tests {
     }
 
     /*
+    #[test]
+    fn order_missing_tx() {
+        todo!("check missing transactions during order() returns an error");
+    }
+
         #[test]
         fn empty_dag() {
             let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
