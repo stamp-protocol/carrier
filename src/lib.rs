@@ -11,7 +11,7 @@ use stamp_core::{
         CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature,
     },
     dag::{Dag, DagNode, Transaction, TransactionBody, TransactionID, Transactions},
-    identity::{keychain::AdminKey, IdentityID},
+    identity::IdentityID,
     util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -130,7 +130,7 @@ impl Clone for TopicSecret {
 
 /// An object that maps a secret seed to a transaction ID (the transaction pointed to should be a
 /// control packet that contains rekey data).
-#[derive(Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
+#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct SecretEntry {
     /// The transaction ID this entry references. If this is `None` then it means the *current*
@@ -155,7 +155,7 @@ impl SecretEntry {
 impl SerdeBinary for SecretEntry {}
 
 /// Holds information about a public cryptographic encryption key.
-#[derive(Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
+#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct KeyPacketEntry {
     /// The identity id that owns the included public key
@@ -175,7 +175,7 @@ impl SerdeBinary for KeyPacketEntry {}
 /// This allows a (potential) member to publish a number of random pre-generated cryptographic keys
 /// that others can verify that they own, enabling participants to avoid using the long-lived sync
 /// crypto key (if possible).
-#[derive(Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
+#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct KeyPacket {
     /// The cryptographic hash of the serialized `entry`.
@@ -298,7 +298,7 @@ impl MemberRekey {
         let msg = self
             .secrets()
             .get(our_device_id)
-            .ok_or_else(|| Error::MemberMissingDevice(our_device_id.clone()))?;
+            .ok_or_else(|| Error::MemberMissingDevice(transaction_id.clone(), our_device_id.clone()))?;
         let enc = msg.message().deref();
         let dec = recipient_crypto_keypairs
             .iter()
@@ -574,6 +574,14 @@ impl TopicTransaction {
         }
     }
 
+    /// Returns whether or not this transaction houses a control packet.
+    pub fn is_control_packet(&self) -> Result<bool> {
+        match self.get_packet()? {
+            Packet::MemberDevicesUpdate { .. } | Packet::MemberPermissionsChange { .. } | Packet::TopicRekey { .. } => Ok(true),
+            Packet::DataSet { .. } | Packet::DataUnset { .. } => Ok(false),
+        }
+    }
+
     /// Returns if this is an unset packet or not.
     pub fn is_unset(&self) -> Result<bool> {
         match self.transaction().entry().body() {
@@ -597,6 +605,12 @@ impl TopicTransaction {
             }
             _ => Err(Error::PacketInvalid(self.id().clone()))?,
         }
+    }
+}
+
+impl From<Transaction> for TopicTransaction {
+    fn from(t: Transaction) -> Self {
+        Self::new(t)
     }
 }
 
@@ -624,6 +638,11 @@ impl TopicID {
         rng.fill_bytes(&mut randbuf);
         Self(Binary::new(randbuf))
     }
+
+    /// Create a `TopicID` from a byte array.
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Binary::new(bytes))
+    }
 }
 
 impl SerdeBinary for TopicID {}
@@ -631,9 +650,11 @@ impl SerdeBinary for TopicID {}
 /// A data topic. This is a structure built from running a DAG of transactions in order. It tracks
 /// the keys used to decrypt data contained in the topic, information on members of the topic and
 /// their permissions within the topic, as well as the data contained within the topic itself.
-#[derive(Debug, getset::Getters, getset::MutGetters, getset::Setters)]
+#[derive(Clone, Debug, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct Topic {
+    /// This topic's unique ID
+    id: TopicID,
     /// A collection of secret seeds, in order of the DAG control packets, that allow deriving the
     /// topic's current (or past) secret key(s).
     secrets: Vec<SecretEntry>,
@@ -649,8 +670,9 @@ pub struct Topic {
 
 impl Topic {
     /// Create a new empty `Topic` object.
-    pub fn new() -> Self {
+    pub fn new(id: TopicID) -> Self {
         Self {
+            id,
             secrets: Vec::new(),
             keychain: HashMap::new(),
             members: HashMap::new(),
@@ -665,6 +687,7 @@ impl Topic {
     /// uses our crypto keypairs to decrypt any topic secrets in the control packets. This allows
     /// us to full build our topic state.
     pub fn new_from_transactions(
+        id: TopicID,
         transactions: &[TopicTransaction],
         identities: &HashMap<IdentityID, &Transactions>,
         our_master_key: &SecretKey,
@@ -672,9 +695,52 @@ impl Topic {
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
     ) -> Result<Self> {
-        let mut topic = Self::new();
-        topic.push_transactions(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
-        Ok(topic)
+        Self::new(id).push_transactions(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)
+    }
+
+    /// Push a new secret into the topic
+    fn push_secret(&mut self, secret: SecretEntry) -> Result<()> {
+        // only add the secret if it's unique
+        let secret_exists = self
+            .secrets()
+            .iter()
+            .find(|existing| existing.transaction_id() == secret.transaction_id())
+            .is_some();
+        if secret_exists {
+            return Ok(());
+        }
+        let transaction_id = secret
+            .transaction_id()
+            .as_ref()
+            .ok_or_else(|| Error::TopicSecretMissingTransactionID)?
+            .clone();
+        let secret_key = secret.secret().derive_secret_key()?;
+        self.secrets_mut().push(secret);
+        self.keychain_mut().insert(transaction_id, secret_key);
+        Ok(())
+    }
+
+    /// Create a new packet that re-keys the topic.
+    ///
+    /// This does not apply the packet, it's your responsibility to call [`transaction_from_packet()`]
+    /// / [`push_transactions()`] yourself.
+    pub fn rekey<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+        members: Vec<(Member, &HashMap<&DeviceID, &CryptoKeypairPublic>)>,
+    ) -> Result<Packet> {
+        let mut secrets = self.secrets().clone();
+        secrets.push(SecretEntry::new_current_transaction(TopicSecret::new(rng)));
+        let rekeys = members
+            .into_iter()
+            .map(|(member, recipient_device_pubkeys)| MemberRekey::seal(rng, member, recipient_device_pubkeys, secrets.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Packet::TopicRekey { members: rekeys })
+    }
+
+    /// Returns the topic's current [`SecretKey`] (if the topic has any secret entries).
+    pub fn current_secret_key(&self) -> Result<Option<SecretKey>> {
+        self.secrets().last().map(|x| x.secret().derive_secret_key()).transpose()
     }
 
     /// Check if the permissions on a transaction are valid.
@@ -689,11 +755,30 @@ impl Topic {
         Ok(())
     }
 
+    /// Push a set of *finalized* transactions into this topic, consuming the topic and returning a
+    /// new one with the transactions applied.
+    ///
+    /// This verifies the transactions at the top-level with their issuing identities, so have
+    /// those handy when calling. We also need to pass in our master key to unlock our crypto
+    /// keypairs, allowing us to apply key changes in the topic sent to us.
+    pub fn push_transactions(
+        mut self,
+        transactions: &[TopicTransaction],
+        identities: &HashMap<IdentityID, &Transactions>,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<Self> {
+        self.push_transactions_mut(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
+        Ok(self)
+    }
+
     /// Allows staging a transaction (adding it to a clone of our current accepted transaction list
     /// and aplying its changes to see if they're valid). If everything checks out, we return a new
     /// topic with all transactions (including the pushed one) run in-order and the state
     /// reflecting these transactions.
-    pub fn push_transactions(
+    pub fn push_transactions_mut(
         &mut self,
         transactions: &[TopicTransaction],
         identities: &HashMap<IdentityID, &Transactions>,
@@ -702,8 +787,22 @@ impl Topic {
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
     ) -> Result<bool> {
-        let nodes_old = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
-        let nodes_new = transactions.iter().map(|x| x.into()).collect::<Vec<_>>();
+        // index transactions we've alrady processed here
+        let mut exists_idx: HashSet<&TransactionID> = HashSet::new();
+        let nodes_old = self
+            .transactions()
+            .iter()
+            .map(|x| {
+                exists_idx.insert(x.id());
+                x.into()
+            })
+            .collect::<Vec<DagNode<_, _>>>();
+        let nodes_new = transactions
+            .iter()
+            // don't re-run transactions we've already processed
+            .filter(|n| !exists_idx.contains(n.id()))
+            .map(|x| x.into())
+            .collect::<Vec<_>>();
 
         // verify our transactions against their respective identities
         for trans in transactions {
@@ -849,12 +948,19 @@ impl Topic {
                 // every rekey necessarily rebuilds the entire member set
                 self.members_mut().clear();
                 for member_rekey in members {
-                    let member = if member_rekey.member().identity_id() == our_identity_id {
+                    let rekey_is_relevant_to_us =
+                        member_rekey.member().identity_id() == our_identity_id && member_rekey.secrets().contains_key(our_device_id);
+                    let member = if rekey_is_relevant_to_us {
                         let (member, secrets) = member_rekey.open(our_master_key, our_crypto_keypairs, our_device_id, transaction.id())?;
-                        for secret in secrets {
+                        for mut secret in secrets {
                             self.keychain_mut()
                                 .insert(transaction.id().clone(), secret.secret().derive_secret_key()?);
-                            self.secrets_mut().push(secret);
+                            if secret.transaction_id().is_none() {
+                                // make sure the secret entry gets set to the current transaction
+                                // *if its transaction_id field is empty*
+                                secret.set_transaction_id(Some(transaction.id().clone()));
+                            }
+                            self.push_secret(secret)?;
                         }
                         member
                     } else {
@@ -887,53 +993,29 @@ impl Topic {
             .collect::<Vec<_>>()
     }
 
-    /// Create and push a transaction into this topic
-    pub fn create_and_apply_transaction<T: Into<Timestamp> + Clone>(
-        &mut self,
-        master_key: &SecretKey,
-        admin_key: &AdminKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
-        our_identity_id: &IdentityID,
-        our_device_id: &DeviceID,
+    /// Create a Stamp transaction from a packet.
+    pub fn transaction_from_packet<T: Into<Timestamp> + Clone>(
+        &self,
         transactions: &Transactions,
         hash_with: &HashAlgo,
+        previous_transactions: Option<Vec<TransactionID>>,
         now: T,
-        topic_id: TopicID,
         packet: &Packet,
-    ) -> Result<&TopicTransaction> {
+    ) -> Result<Transaction> {
         let packet_ser = packet.serialize_binary()?;
-        let prev = self.find_leaves().into_iter().cloned().collect::<Vec<_>>();
+        let prev = previous_transactions.unwrap_or_else(|| self.find_leaves().into_iter().cloned().collect::<Vec<_>>());
         let ty = Vec::from(b"/stamp/sync/v1/packet");
-        let topic_id_ser = topic_id.serialize_binary()?;
-        let trans = transactions
-            .ext(
-                hash_with,
-                now,
-                prev,
-                Some(ty.into()),
-                Some([(b"topic_id".as_slice(), &topic_id_ser[..])]),
-                packet_ser.into(),
-            )?
-            .sign(master_key, admin_key)?;
-        let transaction = TopicTransaction::new(trans);
-        self.apply_transaction(transaction, master_key, our_crypto_keypairs, our_identity_id, our_device_id)
+        let topic_id_ser = self.id().serialize_binary()?;
+        let trans = transactions.ext(
+            hash_with,
+            now,
+            prev,
+            Some(ty.into()),
+            Some([(b"topic_id".as_slice(), &topic_id_ser[..])]),
+            packet_ser.into(),
+        )?;
+        Ok(trans)
     }
-
-    /*
-    /// Create and push a new operation into this topic.
-    pub fn push_data<T: Into<Timestamp>>(
-        &mut self,
-        master_key: &SecretKey,
-        sign_key: &AdminKeypair,
-        now: T,
-        op: OperationAction,
-    ) -> Result<&TopicTransaction> {
-        let prev = self.find_leaves().into_iter().cloned().collect();
-        let op = TopicTransaction::new(master_key, sign_key, now, prev, op)?;
-        self.operations.push(op);
-        Ok(())
-    }
-    */
 
     /// Return this operation set as a [`Dag`], which provides information on the structure of the
     /// DAG itself (missing nodes, unvisited/unreachable nodes) and also allows
@@ -946,7 +1028,7 @@ impl Topic {
 
     /// Return all operations in this set, ordered causally. This will return an error if we have
     /// any breaks in our causal chain (ie, missing transactions).
-    pub fn order<'a>(&'a self) -> Result<Vec<&'a TopicTransaction>> {
+    pub fn get_transactions_ordered<'a>(&'a self) -> Result<Vec<&'a TopicTransaction>> {
         if self.transactions().len() == 0 {
             return Ok(Vec::new());
         }
@@ -1069,15 +1151,42 @@ impl Topic {
                 .index()
                 .get(node_id)
                 .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
-            if !node.node().is_unset()? && !unsets.contains(node.node().id()) {
-                // NOTE: we can't push `node.node()` directly here because it's a clone of our
-                // original list, so instead we pull from our dumb tx index.
-                if let Some(tx) = tx_index.remove(node.node().id()) {
-                    output.push(tx);
-                }
+            // NOTE: we can't push `node.node()` directly here because it's a clone of our
+            // original list, so instead we pull from our dumb tx index.
+            if let Some(tx) = tx_index.remove(node.node().id()) {
+                output.push(tx);
             }
         }
         Ok(output)
+    }
+
+    /// Returns all `DataSet` operations, in order, decrypted.
+    pub fn get_data<T>(&self) -> Result<Vec<Result<T>>>
+    where
+        T: SerdeBinary,
+    {
+        let data_ops = self
+            .get_transactions_ordered()?
+            .iter()
+            .map(|t| match t.get_packet() {
+                Ok(packet) => match packet {
+                    Packet::DataSet { key_ref, payload } => {
+                        let secret_key = self.keychain.get(&key_ref).ok_or_else(|| Error::TopicSecretNotFound(key_ref))?;
+                        let plaintext = secret_key.open(&payload)?;
+                        let des = T::deserialize_binary(&plaintext)?;
+                        Ok(Some(des))
+                    }
+                    _ => Ok(None),
+                },
+                Err(e) => Err(e),
+            })
+            .filter_map(|t| match t {
+                Ok(Some(val)) => Some(Ok(val)),
+                Err(e) => Some(Err(e)),
+                _ => None,
+            })
+            .collect::<Vec<Result<_>>>();
+        Ok(data_ops)
     }
 
     /// Create a snapshot at a specific point in the operation chain.
@@ -1227,16 +1336,24 @@ pub(crate) mod tests {
     use stamp_core::{
         crypto::base::{
             rng::{self, ChaCha20Rng, CryptoRng, RngCore},
-            HashAlgo, SecretKey,
+            Hash, HashAlgo, SecretKey,
         },
         dag::tx_chain,
-        identity::keychain::ExtendKeypair,
+        identity::keychain::{AdminKey, ExtendKeypair, Key},
     };
+    use std::cell::{Ref, RefCell};
     use std::str::FromStr;
 
-    fn create_fake_identity<R: RngCore + CryptoRng>(rng: &mut R, now: Timestamp) -> (SecretKey, Transactions, AdminKey) {
+    fn ts(time: &'static str) -> Timestamp {
+        Timestamp::from_str(time).unwrap()
+    }
+
+    fn create_fake_identity_with_master<R: RngCore + CryptoRng>(
+        rng: &mut R,
+        now: Timestamp,
+        master_key: SecretKey,
+    ) -> (SecretKey, Transactions, AdminKey) {
         let transactions = stamp_core::dag::Transactions::new();
-        let master_key = stamp_core::crypto::base::SecretKey::new_xchacha20poly1305(rng).unwrap();
         let admin = stamp_core::identity::keychain::AdminKeypair::new_ed25519(rng, &master_key).unwrap();
         let admin_key = stamp_core::identity::keychain::AdminKey::new(admin, "Alpha", None);
         let policy = stamp_core::policy::Policy::new(
@@ -1246,13 +1363,44 @@ pub(crate) mod tests {
                 participants: vec![admin_key.key().clone().into()],
             },
         );
-        let trans = transactions
-            .create_identity(&HashAlgo::Blake3, now, vec![admin_key.clone()], vec![policy])
-            .unwrap()
-            .sign(&master_key, &admin_key)
+        let sign_key = Key::new_sign(SignKeypair::new_ed25519(rng, &master_key).unwrap());
+        let crypto_key = Key::new_crypto(CryptoKeypair::new_curve25519xchacha20poly1305(rng, &master_key).unwrap());
+        let transactions = transactions
+            .clone()
+            .push_transaction(
+                transactions
+                    .create_identity(&HashAlgo::Blake3, now.clone(), vec![admin_key.clone()], vec![policy])
+                    .unwrap()
+                    .sign(&master_key, &admin_key)
+                    .unwrap(),
+            )
             .unwrap();
-        let transactions2 = transactions.push_transaction(trans).unwrap();
-        (master_key, transactions2, admin_key)
+        let transactions = transactions
+            .clone()
+            .push_transaction(
+                transactions
+                    .add_subkey(&HashAlgo::Blake3, now.clone(), sign_key, "/stamp/sync/v1/sign", None)
+                    .unwrap()
+                    .sign(&master_key, &admin_key)
+                    .unwrap(),
+            )
+            .unwrap();
+        let transactions = transactions
+            .clone()
+            .push_transaction(
+                transactions
+                    .add_subkey(&HashAlgo::Blake3, now.clone(), crypto_key, "/stamp/sync/v1/crypto", None)
+                    .unwrap()
+                    .sign(&master_key, &admin_key)
+                    .unwrap(),
+            )
+            .unwrap();
+        (master_key, transactions, admin_key)
+    }
+
+    fn create_fake_identity<R: RngCore + CryptoRng>(rng: &mut R, now: Timestamp) -> (SecretKey, Transactions, AdminKey) {
+        let master_key = SecretKey::new_xchacha20poly1305(rng).unwrap();
+        create_fake_identity_with_master(rng, now, master_key)
     }
 
     #[allow(dead_code)]
@@ -1284,7 +1432,6 @@ pub(crate) mod tests {
     ) -> Transaction {
         let packet_ser = packet.serialize_binary().unwrap();
         let topic_id_ser = topic_id.serialize_binary().unwrap();
-        let identity_id = transactions.identity_id().unwrap();
         transactions
             .ext(
                 &HashAlgo::Blake3,
@@ -1335,7 +1482,164 @@ pub(crate) mod tests {
         }
     }
 
+    #[derive(Clone, Debug, getset::Getters, getset::MutGetters, getset::Setters)]
+    #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
+    struct Peer {
+        rng: ChaCha20Rng,
+        #[getset(skip)]
+        topic: RefCell<Topic>,
+        master_passphrase: &'static str,
+        master_key: SecretKey,
+        identity: Transactions,
+        device: Device,
+        crypto_keys: Vec<CryptoKeypair>,
+        key_packets: Vec<KeyPacket>,
+    }
+
+    impl Peer {
+        fn topic(&self) -> Ref<'_, Topic> {
+            self.topic.borrow()
+        }
+
+        fn passphrase_to_key(passphrase: &'static str) -> SecretKey {
+            let bytes: [u8; 32] = Hash::new_blake3(passphrase.as_bytes()).unwrap().as_bytes().try_into().unwrap();
+            SecretKey::new_xchacha20poly1305_from_bytes(bytes).unwrap()
+        }
+
+        fn new_identity<R: RngCore + CryptoRng>(rng_seed: &mut R, master_passphrase: &'static str, device_name: &str) -> Self {
+            let mut randbuf = [0u8; 32];
+            rng_seed.fill_bytes(&mut randbuf);
+            let mut rng = rng::chacha20_seeded(randbuf);
+
+            let topic = Topic::new(TopicID::new(&mut rng));
+
+            let (master_key, transactions, _admin_key) = create_fake_identity_with_master(
+                &mut rng,
+                Timestamp::from_str("2024-01-01T00:00:06Z").unwrap(),
+                Self::passphrase_to_key(master_passphrase),
+            );
+
+            let identity = transactions.build_identity().unwrap();
+            let sign_key = identity
+                .keychain()
+                .subkey_by_name("/stamp/sync/v1/sign")
+                .unwrap()
+                .key()
+                .as_signkey()
+                .unwrap();
+
+            let device = Device::new(&mut rng, device_name.into());
+            let crypto_keys = (0..5)
+                .into_iter()
+                .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap())
+                .collect::<Vec<_>>();
+            let key_packets = crypto_keys
+                .iter()
+                .map(|k| KeyPacket::new(&master_key, sign_key, identity.id().clone(), device.id().clone(), k.clone().into()).unwrap())
+                .collect::<Vec<_>>();
+            Self {
+                rng,
+                topic: RefCell::new(topic),
+                master_passphrase,
+                master_key,
+                identity: transactions,
+                device,
+                crypto_keys,
+                key_packets,
+            }
+        }
+
+        fn new_device(&mut self, device_name: &str) -> Self {
+            let mut randbuf = [0u8; 32];
+            self.rng_mut().fill_bytes(&mut randbuf);
+            let mut rng = rng::chacha20_seeded(randbuf);
+
+            let topic = Topic::new(self.topic().id().clone());
+            let master_key = Self::passphrase_to_key(self.master_passphrase());
+
+            let identity = self.identity().build_identity().unwrap();
+            let sign_key = identity
+                .keychain()
+                .subkey_by_name("/stamp/sync/v1/sign")
+                .unwrap()
+                .key()
+                .as_signkey()
+                .unwrap();
+
+            let device = Device::new(&mut rng, device_name.into());
+            let crypto_keys = (0..5)
+                .into_iter()
+                .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap())
+                .collect::<Vec<_>>();
+            let key_packets = crypto_keys
+                .iter()
+                .map(|k| KeyPacket::new(&master_key, sign_key, identity.id().clone(), device.id().clone(), k.clone().into()).unwrap())
+                .collect::<Vec<_>>();
+
+            Self {
+                rng,
+                topic: RefCell::new(topic),
+                master_passphrase: self.master_passphrase(),
+                master_key,
+                identity: self.identity.clone(),
+                device,
+                crypto_keys,
+                key_packets,
+            }
+        }
+
+        fn as_member(&self, permissions: Vec<Permission>, devices: Vec<Device>) -> Member {
+            Member::new(self.identity().identity_id().unwrap().clone(), permissions, devices)
+        }
+
+        fn tx(&self, now: Timestamp, prev: Option<Vec<TransactionID>>, packet: Packet) -> Transaction {
+            let identity = self.identity().build_identity().unwrap();
+            let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap();
+            let transaction = self
+                .topic()
+                .transaction_from_packet(self.identity(), &HashAlgo::Blake3, prev, now, &packet)
+                .unwrap();
+            transaction.sign(self.master_key(), admin_key).unwrap()
+        }
+
+        fn tx_data<T: SerdeBinary>(
+            &mut self,
+            now: Timestamp,
+            payload: T,
+            prev: Option<Vec<TransactionID>>,
+            control_id: Option<TransactionID>,
+        ) -> Transaction {
+            let payload_plaintext = payload.serialize_binary().unwrap();
+            let topic_seckey = self.topic().current_secret_key().unwrap().unwrap();
+            let control_id =
+                control_id.unwrap_or_else(|| self.topic().secrets().last().unwrap().transaction_id().as_ref().unwrap().clone());
+            let packet = Packet::DataSet {
+                key_ref: control_id,
+                payload: topic_seckey.seal(&mut self.rng_mut(), &payload_plaintext[..]).unwrap(),
+            };
+            self.tx(now, prev, packet)
+        }
+
+        fn push_tx(&self, identities: &HashMap<IdentityID, &Transactions>, transactions: &[Transaction]) -> Result<()> {
+            let topic_tx = transactions.iter().map(|t| t.clone().into()).collect::<Vec<_>>();
+            let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
+            let topic = self.topic.replace(fake_topic).push_transactions(
+                &topic_tx[..],
+                identities,
+                self.master_key(),
+                &self.crypto_keys().iter().collect::<Vec<_>>(),
+                &self.identity.identity_id().unwrap(),
+                &self.device().id().clone(),
+            )?;
+            // take the topic out of the peer so we can mutate it without the borrow checker
+            // blowing a gasket
+            self.topic.replace(topic);
+            Ok(())
+        }
+    }
+
     fn create_1p_topic(
+        topic_id: &TopicID,
         master_key: &SecretKey,
         admin_key: &AdminKey,
         identity: &Transactions,
@@ -1350,67 +1654,25 @@ pub(crate) mod tests {
             .map(|t| TopicTransaction::new(t))
             .collect::<Vec<_>>();
         let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
-        Topic::new_from_transactions(&transactions[..], &identity_map, master_key, &[&crypto_key], &identity_id, device_id).unwrap()
+        Topic::new_from_transactions(
+            topic_id.clone(),
+            &transactions[..],
+            &identity_map,
+            master_key,
+            &[&crypto_key],
+            &identity_id,
+            device_id,
+        )
+        .unwrap()
     }
 
-    /*
     #[test]
-    fn tx_chain_lol() {
+    fn topic_push_transaction() {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
-        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, Timestamp::from_str("2024-01-01T00:00:06Z").unwrap());
-        let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
+        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
         let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
 
         let topic_id = TopicID::new(&mut rng);
-        let topic_key = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
-        let topic_secret = TopicSecret::new(&mut rng);
-        let topic_seckey = topic_secret.derive_secret_key().unwrap();
-
-        let members = vec![MemberRekey::seal(
-            &mut rng,
-            &node_a_sync_crypto.clone().into(),
-            transactions.identity_id().unwrap(),
-            &vec![SecretEntry::new_current_transaction(topic_secret.clone())],
-        )];
-
-        let packet_tx = |now, prev, packet| packet_body(&transactions, now, prev, &topic_id, &packet);
-        let mut packet_tx_data = |id: &TransactionID, payload_plaintext: &[u8]| Packet::DataSet {
-            key_ref: id.clone(),
-            payload: topic_seckey.seal(&mut rng, payload_plaintext).unwrap(),
-        };
-
-        let (transactions, _name_to_op, id_to_name) = tx_chain! {
-            [
-                A = ("2024-01-03T00:01:01Z", |now, prev| packet_tx(now, prev, Packet::TopicRekey { members: vec![] }));
-                B = ("2024-01-02T00:01:01Z", |now, prev| packet_tx(now, prev, packet_tx_data(A.id(), b"pardon me")));
-                C = ("2024-01-02T00:01:01Z", |now, prev| packet_tx(now, prev, packet_tx_data(A.id(), b"may i use your bathroom??!")));
-                D = ("2024-01-04T00:01:01Z", |now, prev| packet_tx(now, prev, Packet::DataUnset { transaction_ids: vec![C.id().clone()] }));
-                E = ("2024-01-02T00:01:01Z", |now, prev| packet_tx(now, prev, packet_tx_data(A.id(), b"thank you!!")));
-                F = ("2024-01-02T00:01:01Z", |now, prev| packet_tx(now, prev, packet_tx_data(A.id(), b"aughh!")));
-                G = ("2024-01-04T00:01:01Z", |now, prev| packet_tx(now, prev, Packet::DataUnset { transaction_ids: vec![E.id().clone()] }));
-            ],
-            [
-                [A] <- [B],
-                [A, B] <- [C],
-                [C] <- [D, E],
-                [E] <- [F],
-                [D, F] <- [G],
-            ],
-        };
-        dump_tx(&id_to_name, &transactions[..]);
-    }
-    */
-
-    #[test]
-    fn order_topic() {
-        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
-        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, Timestamp::from_str("2024-01-01T00:00:06Z").unwrap());
-        let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
-        let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
-        let node_a_device_id = DeviceID::new(&mut rng);
-
-        let topic_id = TopicID::new(&mut rng);
-        let topic_key = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
         let topic_secret = TopicSecret::new(&mut rng);
         let topic_seckey = topic_secret.derive_secret_key().unwrap();
 
@@ -1436,14 +1698,14 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let (topic_tx, _name_to_op, id_to_name) = tx_chain! {
+        let (topic_tx, _name_to_tx, _id_to_name) = tx_chain! {
             [
                 A = ("2024-01-03T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::TopicRekey { members: vec![node_a_member.clone()] }));
                 B = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"pardon me"));
                 C = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"may i use your bathroom??!"));
                 D = ("2024-01-04T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![C.id().clone()] }));
                 E = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"thank you!!"));
-                F = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"aughh!"));
+                F = ("2024-01-02T00:01:02Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"aughh!"));
                 G = ("2024-01-04T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![E.id().clone()] }));
             ],
             [
@@ -1454,155 +1716,937 @@ pub(crate) mod tests {
                 [D, F] <- [G],
             ],
         };
-        let topic = create_1p_topic(&master_key, &admin_key, &transactions, &node_a_sync_crypto, member.devices()[0].id(), topic_tx);
-        let ordered = topic
-            .order()
-            .unwrap()
-            .into_iter()
-            .map(|x| id_to_name.get(x.id()).unwrap())
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(ordered, vec!["A", "B", "F"]);
+
+        let push = |topic: &mut Topic, tx: Vec<Transaction>| {
+            let txt = tx
+                .into_iter()
+                .map(|t| t.sign(&master_key, &admin_key).unwrap())
+                .map(|t| TopicTransaction::new(t))
+                .collect::<Vec<_>>();
+            let identity_id = transactions.identity_id().unwrap();
+            let identity_map = HashMap::from([(identity_id.clone(), &transactions)]);
+            topic.push_transactions_mut(
+                &txt[..],
+                &identity_map,
+                &master_key,
+                &[&node_a_sync_crypto],
+                &identity_id,
+                member.devices()[0].id(),
+            )
+        };
+        {
+            let mut topic = Topic::new(topic_id.clone());
+            push(&mut topic, Vec::from(&topic_tx[0..3])).unwrap();
+            push(&mut topic, Vec::from(&topic_tx[3..])).unwrap();
+        }
+        {
+            let mut topic = Topic::new(topic_id.clone());
+            push(&mut topic, Vec::from(&topic_tx[0..3])).unwrap();
+            let res = push(&mut topic, Vec::from(&topic_tx[4..]));
+            match res.err().unwrap() {
+                Error::TopicMissingTransactions(tx1) => {
+                    assert_eq!(tx1, vec![topic_tx[3].id().clone()]);
+                }
+                _ => panic!("unexpected"),
+            }
+        }
     }
 
-    /*
     #[test]
-    fn order_missing_tx() {
-        todo!("check missing transactions during order() returns an error");
+    fn key_packet_new_verify() {
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
+        let (master_key, transactions, _admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
+        let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
+        let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
+
+        let device = Device::new(&mut rng, "laptop".into());
+        let packet = KeyPacket::new(
+            &master_key,
+            &node_a_sync_sig,
+            transactions.identity_id().unwrap(),
+            device.id().clone(),
+            node_a_sync_crypto.clone().into(),
+        )
+        .unwrap();
+
+        packet.verify(&node_a_sync_sig.clone().into()).unwrap();
+        assert_eq!(packet.entry().pubkey(), &node_a_sync_crypto.clone().into());
+
+        {
+            let mut packet = packet.clone();
+            let fake_identity_id = IdentityID::from(TransactionID::from(Hash::new_blake3(b"zing").unwrap()));
+            packet.entry_mut().set_identity_id(fake_identity_id.clone());
+            let res = packet.verify(&node_a_sync_sig.clone().into());
+            match res {
+                Err(Error::KeyPacketTampered) => {}
+                _ => panic!("unexpected: {:?}", res),
+            }
+        }
     }
 
-        #[test]
-        fn empty_dag() {
-            let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
-            let master_key = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
-            let sign_key = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
+    #[test]
+    fn topic_get_transactions_ordered() {
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
+        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
+        let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
 
-            let (operations, _name_to_op, id_to_name) = op_chain! {
-                &master_key, &sign_key,
-                [
-                    A = ("2024-01-03T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"get").unwrap()));
-                    B = ("2024-01-02T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"a").unwrap()));
-                    C = ("2024-01-03T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"job").unwrap()));
-                    D = ("2024-01-04T00:01:01Z", OperationAction::Unset(C.id.clone()));
-                    E = ("2024-01-08T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"lol").unwrap()));
-                    F = ("2024-01-05T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"gfffft").unwrap()));
-                    G = ("2024-01-06T00:01:01Z", OperationAction::Unset(E.id.clone()));
-                ],
-                [ ],
-            };
-            let ordered = operations
-                .order(&sign_key.clone().into())
+        let topic_id = TopicID::new(&mut rng);
+        let topic_secret = TopicSecret::new(&mut rng);
+        let topic_seckey = topic_secret.derive_secret_key().unwrap();
+
+        let mut pkt = PacketGen::new(&mut rng, &transactions, &topic_id, &topic_seckey);
+
+        let member = Member::new(
+            transactions.identity_id().unwrap(),
+            vec![
+                Permission::DataSet,
+                Permission::DataUnset,
+                Permission::MemberDevicesUpdate,
+                Permission::MemberPermissionsChange,
+                Permission::TopicRekey,
+            ],
+            vec![Device::new(&mut rng, "laptop".into())],
+        );
+
+        let node_a_member = MemberRekey::seal(
+            &mut rng,
+            member.clone(),
+            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            vec![SecretEntry::new_current_transaction(topic_secret.clone())],
+        )
+        .unwrap();
+
+        let (topic_tx, name_to_tx, id_to_name) = tx_chain! {
+            [
+                A = ("2024-01-03T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::TopicRekey { members: vec![node_a_member.clone()] }));
+                B = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"pardon me"));
+                C = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"may i use your bathroom??!"));
+                D = ("2024-01-04T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![C.id().clone()] }));
+                E = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"thank you!!"));
+                F = ("2024-01-02T00:01:02Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"aughh!"));
+                G = ("2024-01-04T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![E.id().clone()] }));
+            ],
+            [
+                [A] <- [B],
+                [A, B] <- [C],
+                [C] <- [D, E],
+                [E] <- [F],
+                [D, F] <- [G],
+            ],
+        };
+        let topic = create_1p_topic(
+            &topic_id,
+            &master_key,
+            &admin_key,
+            &transactions,
+            &node_a_sync_crypto,
+            member.devices()[0].id(),
+            topic_tx.clone(),
+        );
+        {
+            let ordered = topic
+                .get_transactions_ordered()
                 .unwrap()
                 .into_iter()
                 .map(|x| id_to_name.get(x.id()).unwrap())
                 .cloned()
                 .collect::<Vec<_>>();
-            assert_eq!(ordered, vec!["B", "A", "F"]);
+            assert_eq!(ordered, vec!["A", "B", "C", "E", "F", "D", "G"]);
+        }
+        {
+            let mut topic = create_1p_topic(
+                &topic_id,
+                &master_key,
+                &admin_key,
+                &transactions,
+                &node_a_sync_crypto,
+                member.devices()[0].id(),
+                topic_tx,
+            );
+            let e_id = name_to_tx.get("E").unwrap().id();
+            topic.transactions_mut().retain(|t| t.id() != e_id);
+            let res = topic.get_transactions_ordered();
+            match res {
+                Err(Error::TopicMissingTransactions(tx)) => {
+                    assert_eq!(tx, vec![e_id.clone()]);
+                }
+                _ => panic!("oh no"),
+            }
+        }
+    }
+
+    #[test]
+    fn topic_multi_user_e2e_workflow() {
+        // creates a lookup table for a set of peers
+        fn id_lookup<'a>(peers: &[&'a Peer]) -> HashMap<IdentityID, &'a Transactions> {
+            peers
+                .iter()
+                .map(|p| (p.identity().identity_id().unwrap(), p.identity()))
+                .collect::<HashMap<_, _>>()
         }
 
-        #[test]
-        fn snapshot_and_order() {
-            let mut rng = rng::chacha20_seeded(
-                Hash::new_blake3(b"i am sleeping under the stars with my dog. he is happy. so am i.")
+        // creates a device_id -> crypto pubkey mapping
+        fn device_lookup<'a>(packets: &[&'a KeyPacket]) -> HashMap<&'a DeviceID, &'a CryptoKeypairPublic> {
+            packets
+                .iter()
+                .map(|p| (p.entry().device_id(), p.entry().pubkey()))
+                .collect::<HashMap<_, _>>()
+        }
+
+        macro_rules! topicdata {
+            ($peer:expr) => {{
+                $peer
+                    .topic()
+                    .get_data::<AppData>()
                     .unwrap()
-                    .as_bytes()
-                    .try_into()
-                    .unwrap(),
-            );
-            let master_key = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
-            let sign_key = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+            }};
+        }
 
-            let (operations, name_to_op, id_to_name) = op_chain! {
-                &master_key, &sign_key,
-                [
-                    A = ("2024-01-03T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"00").unwrap()));
-                    B = ("2024-01-02T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"01").unwrap()));
-                    C = ("2024-01-03T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"02").unwrap()));
-                    D = ("2024-01-03T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"02.5").unwrap()));
-                    E = ("2024-01-04T08:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"03").unwrap()));
-                    F = ("2024-01-05T00:01:01Z", OperationAction::Unset(B.id.clone()));
-                    G = ("2024-01-06T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"94").unwrap()));
-                    H = ("2024-01-05T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"05").unwrap()));
-                    I = ("2024-01-07T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"06").unwrap()));
-                    J = ("2024-01-05T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"96").unwrap()));
-                    K = ("2024-01-05T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"08").unwrap()));
-                    L = ("2024-01-08T00:01:01Z", OperationAction::Unset(J.id.clone()));
-                    M = ("2024-01-09T00:01:01Z", OperationAction::Set(master_key.seal(&mut rng, b"10").unwrap()));
-                ],
-                [
-                    // branch1
-                    [A, B] <- [C],
-                    [C] <- [D, E],
-                    [E] <- [F],
+        // grab the transaction ids currently within a peer's topic
+        macro_rules! txids {
+            ($peer:expr) => {{
+                $peer
+                    .topic()
+                    .get_transactions_ordered()
+                    .unwrap()
+                    .iter()
+                    .map(|t| t.id())
+                    .collect::<Vec<&TransactionID>>()
+            }};
+        }
 
-                    // branch2
-                    [G] <- [H, I],
-                    [H, I] <- [J],
-                    [J] <- [K],
-
-                    // merge the branches. let's get weird
-                    [K, F] <- [L],
-                    [L, D] <- [M],
-                ],
+        // reduces some boilerplate when creating re-key entries
+        macro_rules! rkmember {
+            ($peer:expr, $permissions:expr, $keyidx:expr) => {
+                (
+                    $peer.as_member($permissions, vec![$peer.device().clone()]),
+                    &device_lookup(&[&$peer.key_packets()[$keyidx]]),
+                )
             };
-            macro_rules! assert_op {
-                ($operations:expr, $id_to_name:expr, $idx:expr, $name:expr, $is_snapshot:expr) => {
-                    assert_eq!($id_to_name.get($operations.operations()[$idx].id()), Some(&$name));
-                    assert_eq!($operations.operations()[$idx].snapshot().is_some(), $is_snapshot);
-                };
+        }
+
+        #[derive(Clone, Debug, PartialEq, AsnType, Encode, Decode)]
+        struct AppData {
+            data: String,
+        }
+        impl AppData {
+            fn new<T: Into<String>>(data: T) -> Self {
+                Self { data: data.into() }
             }
-            dump_tx(&id_to_name, &operations);
+        }
+        impl SerdeBinary for AppData {}
+
+        // we use these a lot so make it official
+        let admin_perms = vec![
+            Permission::DataSet,
+            Permission::DataUnset,
+            Permission::MemberDevicesUpdate,
+            Permission::MemberPermissionsChange,
+            Permission::TopicRekey,
+        ];
+
+        // because we can't infer types for some reason
+        let empty_tx = Vec::<&TransactionID>::new();
+
+        // ---------------------------------------------------------------------
+
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
+
+        let mut butch_laptop = Peer::new_identity(&mut rng, "butch123", "laptop");
+        let butch_phone = butch_laptop.new_device("phone");
+        let mut dotty_laptop = Peer::new_identity(&mut rng, "dotty666", "laptop");
+        let mut jerry_laptop = Peer::new_identity(&mut rng, "jerjer1", "laptop");
+        let mut frankie_phone = Peer::new_identity(&mut rng, "frankiehankie", "phone");
+
+        let genesis = {
+            let packet = butch_laptop
+                .topic()
+                .rekey(&mut rng, vec![rkmember!(&butch_laptop, admin_perms.clone(), 0)])
+                .unwrap();
+            butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+        };
+
+        assert_eq!(butch_laptop.topic().secrets().len(), 0);
+        assert_eq!(butch_phone.topic().secrets().len(), 0);
+        assert_eq!(dotty_laptop.topic().secrets().len(), 0);
+        assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+        assert_eq!(frankie_phone.topic().secrets().len(), 0);
+
+        assert_eq!(txids!(&butch_laptop), empty_tx);
+        assert_eq!(txids!(&butch_phone), empty_tx);
+        assert_eq!(txids!(&dotty_laptop), empty_tx);
+        assert_eq!(txids!(&jerry_laptop), empty_tx);
+        assert_eq!(txids!(&frankie_phone), empty_tx);
+
+        // make sure we can only add transactions from identities we've indexed
+        {
+            let res = butch_laptop.push_tx(&id_lookup(&[]), &[genesis.clone()]);
+            match res {
+                Err(Error::IdentityMissing(id)) => {
+                    assert_eq!(id, butch_laptop.identity().identity_id().unwrap());
+                }
+                _ => panic!("unexpected: {:?}", res),
+            }
+        }
+        butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[genesis.clone()]).unwrap();
+
+        assert_eq!(butch_laptop.topic().secrets().len(), 1);
+        assert_eq!(butch_phone.topic().secrets().len(), 0);
+        assert_eq!(dotty_laptop.topic().secrets().len(), 0);
+        assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+        assert_eq!(frankie_phone.topic().secrets().len(), 0);
+
+        assert_eq!(txids!(&butch_laptop), vec![genesis.id()]);
+        assert_eq!(txids!(&butch_phone), empty_tx);
+        assert_eq!(txids!(&dotty_laptop), empty_tx);
+        assert_eq!(txids!(&jerry_laptop), empty_tx);
+        assert_eq!(txids!(&frankie_phone), empty_tx);
+
+        let data1 = butch_laptop.tx_data(ts("2024-12-08T01:00:01Z"), AppData::new("hi i'm butch"), None, None);
+        butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[data1.clone()]).unwrap();
+        assert_eq!(butch_laptop.topic().secrets().len(), 1);
+
+        let rekey1 = {
+            let packet = butch_laptop
+                .topic()
+                .rekey(
+                    &mut rng,
+                    vec![
+                        rkmember!(&butch_laptop, admin_perms.clone(), 0),
+                        rkmember!(&dotty_laptop, admin_perms.clone(), 0),
+                    ],
+                )
+                .unwrap();
+            butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+        };
+
+        assert_eq!(butch_laptop.topic().secrets().len(), 1);
+        assert_eq!(butch_phone.topic().secrets().len(), 0);
+        assert_eq!(dotty_laptop.topic().secrets().len(), 0);
+        assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+        assert_eq!(frankie_phone.topic().secrets().len(), 0);
+        butch_laptop
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[genesis.clone(), rekey1.clone()])
+            .unwrap();
+        dotty_laptop
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data1.clone(), genesis.clone(), rekey1.clone()])
+            .unwrap();
+        assert_eq!(butch_laptop.topic().secrets().len(), 2);
+        assert_eq!(butch_phone.topic().secrets().len(), 0);
+        assert_eq!(dotty_laptop.topic().secrets().len(), 2);
+        assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+        assert_eq!(frankie_phone.topic().secrets().len(), 0);
+
+        assert_eq!(topicdata!(butch_laptop).unwrap(), vec![AppData::new("hi i'm butch")]);
+        assert_eq!(topicdata!(butch_phone).unwrap(), vec![]);
+        assert_eq!(topicdata!(dotty_laptop).unwrap(), vec![AppData::new("hi i'm butch")]);
+        assert_eq!(topicdata!(jerry_laptop).unwrap(), vec![]);
+        assert_eq!(topicdata!(frankie_phone).unwrap(), vec![]);
+
+        // test peer getting packets they cannot decrypt
+        {
+            // test adding transactions with a bad identity set/list
+            {
+                let butch_phone = butch_phone.clone();
+                // try to push transactions without having butch in the id list.
+                {
+                    let res = butch_phone.push_tx(&id_lookup(&[&dotty_laptop]), &[genesis.clone(), rekey1.clone(), data1.clone()]);
+                    match res {
+                        Err(Error::IdentityMissing(ref id)) => {
+                            assert_eq!(id, &butch_laptop.identity().identity_id().unwrap());
+                        }
+                        _ => panic!("unexpected: {:?}", res),
+                    }
+                }
+            }
+            // try adding our transactions to a device/identity we have no concept of yet
+            {
+                let jerry_laptop = jerry_laptop.clone();
+                {
+                    // this should work.
+                    //
+                    // after all, we don't know we don't have the keys we need until we have all
+                    // the transactions for a particular topic. and we can't get all the
+                    // transactions for a particular topic because there might always be a new
+                    // transaction we don't have just around the corner with the keys we want. so
+                    // really we have no good way of detecting missing secrets until we try to grab
+                    // our data.
+                    jerry_laptop
+                        .push_tx(
+                            &id_lookup(&[&butch_laptop, &dotty_laptop, &jerry_laptop]),
+                            &[genesis.clone(), rekey1.clone(), data1.clone()],
+                        )
+                        .unwrap();
+                    // this should fail
+                    let res = topicdata!(jerry_laptop);
+                    match res {
+                        Err(Error::TopicSecretNotFound(txid)) => {
+                            assert_eq!(txid, genesis.id().clone());
+                        }
+                        _ => panic!("unexpected: {:?}", res),
+                    }
+                }
+            }
+        }
+
+        // this timestamp is before data1, but should be ordered AFTER because Dotty has data1
+        // already and is going to set it as the prev to data2.
+        let data2 = dotty_laptop.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("dotty is best"), None, None);
+        dotty_laptop
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data2.clone()])
+            .unwrap();
+        assert_eq!(butch_laptop.topic().secrets().len(), 2);
+        assert_eq!(butch_phone.topic().secrets().len(), 0);
+        assert_eq!(dotty_laptop.topic().secrets().len(), 2);
+        assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+        assert_eq!(frankie_phone.topic().secrets().len(), 0);
+
+        assert_eq!(topicdata!(butch_laptop).unwrap(), vec![AppData::new("hi i'm butch")]);
+        assert_eq!(topicdata!(butch_phone).unwrap(), vec![]);
+        assert_eq!(topicdata!(dotty_laptop).unwrap(), vec![AppData::new("hi i'm butch"), AppData::new("dotty is best")]);
+        assert_eq!(topicdata!(jerry_laptop).unwrap(), vec![]);
+        assert_eq!(topicdata!(frankie_phone).unwrap(), vec![]);
+
+        let data3 = dotty_laptop.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("it is plain to see"), None, None);
+        dotty_laptop
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data3.clone()])
+            .unwrap();
+
+        assert_eq!(topicdata!(butch_laptop).unwrap(), vec![AppData::new("hi i'm butch")]);
+        assert_eq!(topicdata!(butch_phone).unwrap(), vec![]);
+        assert_eq!(
+            topicdata!(dotty_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(topicdata!(jerry_laptop).unwrap(), vec![]);
+        assert_eq!(topicdata!(frankie_phone).unwrap(), vec![]);
+
+        // test out of roerd packets
+        {
+            let butch_laptop = butch_laptop.clone();
+            let res = butch_laptop.push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data3.clone()]);
+            // should give us a list of transactions we need to complete the chain
+            match res {
+                Err(Error::TopicMissingTransactions(txids)) => {
+                    assert_eq!(txids, vec![data2.id().clone()]);
+                }
+                _ => panic!("unexpected: {:?}", res),
+            }
+        }
+
+        butch_laptop
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data3.clone(), data2.clone()])
+            .unwrap();
+        assert_eq!(
+            topicdata!(butch_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(topicdata!(butch_phone).unwrap(), vec![]);
+        assert_eq!(
+            topicdata!(dotty_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(topicdata!(jerry_laptop).unwrap(), vec![]);
+        assert_eq!(topicdata!(frankie_phone).unwrap(), vec![]);
+
+        // now add butch's phone, jerry, and frankie to the topic
+        let rekey2 = {
+            let packet = butch_laptop
+                .topic()
+                .rekey(
+                    &mut rng,
+                    vec![
+                        (
+                            butch_laptop.as_member(admin_perms.clone(), vec![butch_laptop.device().clone(), butch_phone.device().clone()]),
+                            &device_lookup(&[&butch_laptop.key_packets()[0], &butch_phone.key_packets()[0]]),
+                        ),
+                        rkmember!(&dotty_laptop, admin_perms.clone(), 0),
+                        rkmember!(&jerry_laptop, vec![Permission::DataSet, Permission::DataUnset], 0),
+                        rkmember!(&frankie_phone, vec![Permission::DataSet, Permission::DataUnset], 0),
+                    ],
+                )
+                .unwrap();
+            butch_laptop.tx(ts("2024-12-09T00:00:00Z"), None, packet)
+        };
+
+        {
+            let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
+            butch_laptop.push_tx(&all_ids_lookup, &[rekey2.clone()]).unwrap();
+            dotty_laptop.push_tx(&all_ids_lookup, &[rekey2.clone()]).unwrap();
+            assert_eq!(butch_laptop.topic().secrets().len(), 3);
+            assert_eq!(butch_phone.topic().secrets().len(), 0);
+            assert_eq!(dotty_laptop.topic().secrets().len(), 3);
+            assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+            assert_eq!(frankie_phone.topic().secrets().len(), 0);
+            butch_phone
+                .push_tx(
+                    &all_ids_lookup,
+                    &[
+                        genesis.clone(),
+                        rekey1.clone(),
+                        rekey2.clone(),
+                        data1.clone(),
+                        data2.clone(),
+                        data3.clone(),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(butch_laptop.topic().secrets().len(), 3);
+            assert_eq!(butch_phone.topic().secrets().len(), 3);
+            assert_eq!(dotty_laptop.topic().secrets().len(), 3);
+            assert_eq!(jerry_laptop.topic().secrets().len(), 0);
+            assert_eq!(frankie_phone.topic().secrets().len(), 0);
+
             assert_eq!(
-                operations
-                    .operations()
+                topicdata!(butch_laptop).unwrap(),
+                vec![
+                    AppData::new("hi i'm butch"),
+                    AppData::new("dotty is best"),
+                    AppData::new("it is plain to see")
+                ]
+            );
+            assert_eq!(
+                topicdata!(butch_phone).unwrap(),
+                vec![
+                    AppData::new("hi i'm butch"),
+                    AppData::new("dotty is best"),
+                    AppData::new("it is plain to see")
+                ]
+            );
+            assert_eq!(
+                topicdata!(dotty_laptop).unwrap(),
+                vec![
+                    AppData::new("hi i'm butch"),
+                    AppData::new("dotty is best"),
+                    AppData::new("it is plain to see")
+                ]
+            );
+            assert_eq!(topicdata!(jerry_laptop).unwrap(), vec![]);
+            assert_eq!(topicdata!(frankie_phone).unwrap(), vec![]);
+
+            // now catch up everyone in the gang
+            jerry_laptop
+                .push_tx(
+                    &all_ids_lookup,
+                    &[
+                        genesis.clone(),
+                        rekey1.clone(),
+                        rekey2.clone(),
+                        data1.clone(),
+                        data2.clone(),
+                        data3.clone(),
+                    ],
+                )
+                .unwrap();
+            frankie_phone
+                .push_tx(
+                    &all_ids_lookup,
+                    &[
+                        genesis.clone(),
+                        rekey1.clone(),
+                        rekey2.clone(),
+                        data1.clone(),
+                        data2.clone(),
+                        data3.clone(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(butch_laptop.topic().secrets().len(), 3);
+        assert_eq!(butch_phone.topic().secrets().len(), 3);
+        assert_eq!(dotty_laptop.topic().secrets().len(), 3);
+        assert_eq!(jerry_laptop.topic().secrets().len(), 3);
+        assert_eq!(frankie_phone.topic().secrets().len(), 3);
+
+        assert_eq!(
+            topicdata!(butch_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(
+            topicdata!(butch_phone).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(
+            topicdata!(dotty_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(
+            topicdata!(jerry_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(
+            topicdata!(frankie_phone).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+
+        // we're going to test some branching madness now. jerry and frankie have access to write
+        // data, so they're going to do just that. in the meantime, dotty is going to issue a
+        // transaction *timestamped before their data edits* that restricts them from writing data.
+        // this transaction will not be merged by the others until they've all seen the new data.
+        // the goal of this is to test if the jerry/frankie data transactions remain valid even
+        // after becoming aware of dotty's skylarkings.
+        let perms1 = dotty_laptop.tx(
+            ts("2024-12-09T18:00:00Z"),
+            None,
+            Packet::MemberPermissionsChange {
+                identity_id: jerry_laptop.identity().identity_id().unwrap(),
+                permissions: vec![],
+            },
+        );
+        dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[perms1.clone()]).unwrap();
+        let perms2 = dotty_laptop.tx(
+            ts("2024-12-09T18:00:01Z"),
+            None,
+            Packet::MemberPermissionsChange {
+                identity_id: frankie_phone.identity().identity_id().unwrap(),
+                permissions: vec![],
+            },
+        );
+        dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[perms2.clone()]).unwrap();
+
+        let data4 = jerry_laptop.tx_data(ts("2024-12-10T00:00:00Z"), AppData::new("jerry reporting in"), None, None);
+        {
+            let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
+            butch_laptop.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
+            butch_phone.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
+            jerry_laptop.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
+            frankie_phone.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
+        }
+        let data5 = jerry_laptop.tx_data(ts("2024-12-10T00:01:00Z"), AppData::new("just saw a cat"), None, None);
+        {
+            let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
+            butch_laptop.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
+            butch_phone.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
+            jerry_laptop.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
+            frankie_phone.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
+        }
+        let data6 = frankie_phone.tx_data(ts("2024-12-10T00:02:00Z"), AppData::new("i hate cats"), None, None);
+        {
+            let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
+            butch_laptop.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
+            butch_phone.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
+            jerry_laptop.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
+            frankie_phone.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
+        }
+        assert_eq!(
+            topicdata!(butch_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see"),
+                AppData::new("jerry reporting in"),
+                AppData::new("just saw a cat"),
+                AppData::new("i hate cats"),
+            ]
+        );
+        assert_eq!(
+            topicdata!(butch_phone).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see"),
+                AppData::new("jerry reporting in"),
+                AppData::new("just saw a cat"),
+                AppData::new("i hate cats"),
+            ]
+        );
+        assert_eq!(
+            topicdata!(dotty_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see")
+            ]
+        );
+        assert_eq!(
+            topicdata!(jerry_laptop).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see"),
+                AppData::new("jerry reporting in"),
+                AppData::new("just saw a cat"),
+                AppData::new("i hate cats"),
+            ]
+        );
+        assert_eq!(
+            topicdata!(frankie_phone).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("dotty is best"),
+                AppData::new("it is plain to see"),
+                AppData::new("jerry reporting in"),
+                AppData::new("just saw a cat"),
+                AppData::new("i hate cats"),
+            ]
+        );
+
+        // now we combine our hot branches with a cool island merge
+        {
+            let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
+            butch_laptop.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
+            butch_phone.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
+            dotty_laptop
+                .push_tx(&all_ids_lookup, &[data4.clone(), data5.clone(), data6.clone()])
+                .unwrap();
+            jerry_laptop.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
+            frankie_phone.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
+        }
+    }
+
+    #[test]
+    fn topic_empty_dag() {
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
+        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
+        let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
+
+        let topic_id = TopicID::new(&mut rng);
+        let topic_secret = TopicSecret::new(&mut rng);
+        let topic_seckey = topic_secret.derive_secret_key().unwrap();
+
+        let mut pkt = PacketGen::new(&mut rng, &transactions, &topic_id, &topic_seckey);
+
+        let member = Member::new(
+            transactions.identity_id().unwrap(),
+            vec![
+                Permission::DataSet,
+                Permission::DataUnset,
+                Permission::MemberDevicesUpdate,
+                Permission::MemberPermissionsChange,
+                Permission::TopicRekey,
+            ],
+            vec![Device::new(&mut rng, "laptop".into())],
+        );
+
+        let node_a_member = MemberRekey::seal(
+            &mut rng,
+            member.clone(),
+            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            vec![SecretEntry::new_current_transaction(topic_secret.clone())],
+        )
+        .unwrap();
+
+        let (topic_tx, _name_to_tx, id_to_name) = tx_chain! {
+            [
+                A = ("2024-01-03T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::TopicRekey { members: vec![node_a_member.clone()] }));
+                B = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"get a"));
+                C = ("2024-01-03T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"job"));
+                D = ("2024-01-04T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![C.id().clone()] }));
+                E = ("2024-01-08T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"lol"));
+                F = ("2024-01-05T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"gfffft"));
+                G = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![E.id().clone()] }));
+            ],
+            [
+                [A] <- [B, C, D, E, F, G],
+            ],
+        };
+        let topic = create_1p_topic(
+            &topic_id,
+            &master_key,
+            &admin_key,
+            &transactions,
+            &node_a_sync_crypto,
+            member.devices()[0].id(),
+            topic_tx.clone(),
+        );
+
+        {
+            let ordered = topic
+                .get_transactions_ordered()
+                .unwrap()
+                .into_iter()
+                .map(|x| id_to_name.get(x.id()).unwrap())
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(ordered, vec!["A", "B", "C", "D", "F", "E", "G"]);
+        }
+    }
+
+    #[test]
+    fn topic_snapshot_and_order() {
+        let mut rng = rng::chacha20_seeded(
+            Hash::new_blake3(b"i am sleeping under the stars with my dog. he is happy. so am i.")
+                .unwrap()
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+        );
+        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
+        let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
+        let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
+
+        let topic_id = TopicID::new(&mut rng);
+        let topic_secret = TopicSecret::new(&mut rng);
+        let topic_seckey = topic_secret.derive_secret_key().unwrap();
+
+        let mut pkt = PacketGen::new(&mut rng, &transactions, &topic_id, &topic_seckey);
+
+        let member = Member::new(
+            transactions.identity_id().unwrap(),
+            vec![
+                Permission::DataSet,
+                Permission::DataUnset,
+                Permission::MemberDevicesUpdate,
+                Permission::MemberPermissionsChange,
+                Permission::TopicRekey,
+            ],
+            vec![Device::new(&mut rng, "laptop".into())],
+        );
+
+        let node_a_member = MemberRekey::seal(
+            &mut rng,
+            member.clone(),
+            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            vec![SecretEntry::new_current_transaction(topic_secret.clone())],
+        )
+        .unwrap();
+
+        let (topic_tx, name_to_tx, id_to_name) = tx_chain! {
+            [
+                A = ("2024-01-03T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::TopicRekey { members: vec![node_a_member.clone()] }));
+                B = ("2024-01-02T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"00"));
+                C = ("2024-01-03T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"01"));
+                D = ("2024-01-04T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"02"));
+                E = ("2024-01-08T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"03"));
+                F = ("2024-01-05T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![B.id().clone()] }));
+                G = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"05"));
+                H = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"06"));
+                I = ("2024-01-09T00:01:02Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"07"));
+                J = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"08"));
+                K = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"09"));
+                L = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx(now, prev, Packet::DataUnset { transaction_ids: vec![J.id().clone()] }));
+                M = ("2024-01-09T00:01:01Z", |now, prev| pkt.tx_data(now, prev, A.id(), b"10"));
+            ],
+            [
+                // branch1
+                [A] <- [B],
+                [B] <- [C],
+                [C] <- [D, E],
+                [E] <- [F],
+
+                // branch2
+                [A] <- [G],
+                [G] <- [H, I],
+                [H, I] <- [J],
+                [J] <- [K],
+
+                // merge the branches. let's get weird
+                [K, F] <- [L],
+                [L, D] <- [M],
+            ],
+        };
+        macro_rules! assert_op {
+            ($topic_tx:expr, $id_to_name:expr, $idx:expr, $name:expr, $is_snapshot:expr) => {
+                assert_eq!($id_to_name.get($topic_tx.transactions()[$idx].id()), Some(&$name));
+                assert_eq!($topic_tx.transactions()[$idx].snapshot().is_some(), $is_snapshot);
+            };
+        }
+        macro_rules! mktopic {
+            ($topic_tx:expr) => {{
+                create_1p_topic(
+                    &topic_id,
+                    &master_key,
+                    &admin_key,
+                    &transactions,
+                    &node_a_sync_crypto,
+                    member.devices()[0].id(),
+                    $topic_tx,
+                )
+            }};
+        }
+
+        {
+            let topic = mktopic!(topic_tx.clone());
+            assert_eq!(
+                topic
+                    .get_transactions_ordered()
+                    .unwrap()
                     .iter()
                     .map(|x| id_to_name.get(x.id()).unwrap())
                     .cloned()
                     .collect::<Vec<_>>(),
-                vec!["B", "A", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"],
+                vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"],
             );
-            // this test is interesting because E snapshots A, B, & C, but D is E's peer and D
-            // references C *but is timestamped before E*. so in the old way of doing things, this
-            // means that D would come AFTER E because D's prev references that point to any node
-            // snapshotted by E would be overridden to point to E. this means that D would come before
-            // E pre-snapshot but post-snapshot E comes before D (using this previous link overriding
-            // technique). this changes the order of snapshotted nodes, which ultimately should be
-            // preserved (a bug). so we test to make sure that this doesn't happen, because the better
-            // way of doing things is to preserve the links/timestamps for all nodes and let the dag do
-            // the ordering as if those nodes weren't snapshotted at all.
+        }
+
+        // this test is interesting because E snapshots A, B, & C, but D is E's peer and D
+        // references C *but is timestamped before E*. so in the old way of doing things, this
+        // means that D would come AFTER E because D's prev references that point to any node
+        // snapshotted by E would be overridden to point to E. this means that D would come before
+        // E pre-snapshot but post-snapshot E comes before D (using this previous link overriding
+        // technique). this changes the order of snapshotted nodes, which ultimately should be
+        // preserved (a bug). so we test to make sure that this doesn't happen, because the better
+        // way of doing things is to preserve the links/timestamps for all nodes and let the dag do
+        // the ordering as if those nodes weren't snapshotted at all.
+        {
+            let mut topic = mktopic!(topic_tx.clone());
+            let e_id = name_to_tx.get("E").unwrap().id();
+            topic.snapshot(&master_key, &node_a_sync_sig, e_id).unwrap();
+            assert_eq!(
+                topic
+                    .transactions()
+                    .iter()
+                    .map(|x| id_to_name.get(x.id()).unwrap())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"],
+            );
+            assert_op!(topic, id_to_name, 0, "A", false);
+            assert_op!(topic, id_to_name, 1, "B", false);
+            assert_op!(topic, id_to_name, 2, "C", false);
+            assert_op!(topic, id_to_name, 3, "D", false);
+            assert_op!(topic, id_to_name, 4, "E", true);
+            assert_eq!(
+                ids_to_names(&id_to_name, &topic.transactions()[4].snapshot().as_ref().unwrap().active_transactions()),
+                vec!["A", "B", "C", "E"],
+            );
+            assert_op!(topic, id_to_name, 5, "F", false);
+            assert_op!(topic, id_to_name, 6, "G", false);
+            assert_op!(topic, id_to_name, 7, "H", false);
+            assert_op!(topic, id_to_name, 8, "I", false);
+            assert_op!(topic, id_to_name, 9, "J", false);
+            assert_op!(topic, id_to_name, 10, "K", false);
+            assert_op!(topic, id_to_name, 11, "L", false);
+            assert_op!(topic, id_to_name, 12, "M", false);
+            assert_eq!(topic.transactions().get(13), None);
             {
-                let mut operations = operations.clone();
-                let e_id = name_to_op.get("E").unwrap().id();
-                operations.snapshot(&master_key, &sign_key, e_id).unwrap();
-                assert_eq!(
-                    operations
-                        .operations()
-                        .iter()
-                        .map(|x| id_to_name.get(x.id()).unwrap())
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    vec!["B", "A", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"],
-                );
-                assert_op!(operations, id_to_name, 0, "B", false);
-                assert_op!(operations, id_to_name, 1, "A", false);
-                assert_op!(operations, id_to_name, 2, "C", false);
-                assert_op!(operations, id_to_name, 3, "D", false);
-                assert_op!(operations, id_to_name, 4, "E", true);
-                assert_eq!(
-                    ids_to_names(&id_to_name, &operations.operations()[4].snapshot().as_ref().unwrap().active_transaction()),
-                    vec!["B", "A", "C", "E"],
-                );
-                assert_op!(operations, id_to_name, 5, "F", false);
-                assert_op!(operations, id_to_name, 6, "G", false);
-                assert_op!(operations, id_to_name, 7, "H", false);
-                assert_op!(operations, id_to_name, 8, "I", false);
-                assert_op!(operations, id_to_name, 9, "J", false);
-                assert_op!(operations, id_to_name, 10, "K", false);
-                assert_op!(operations, id_to_name, 11, "L", false);
-                assert_op!(operations, id_to_name, 12, "M", false);
-                assert_eq!(operations.operations().get(13), None);
-                let ordered = operations
-                    .order(&sign_key.clone().into())
+                let ordered = topic
+                    .get_transactions_ordered()
                     .unwrap()
                     .into_iter()
                     .map(|x| id_to_name.get(x.id()).unwrap())
@@ -1611,108 +2655,41 @@ pub(crate) mod tests {
                 // NOTE: this is messed up now because E houses B, A, & C and injects them into
                 // E's position instead of naturally sorting them into the DAG as they were previously.
                 // this is because the snapshots only operate on the branch level
-                assert_eq!(ordered, vec!["A", "C", "D", "E", "G", "H", "I", "K", "M"]);
+                assert_eq!(ordered, vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]);
             }
+        }
+        {
+            let mut topic = mktopic!(topic_tx.clone());
+            let h_id = name_to_tx.get("J").unwrap().id();
+            topic.snapshot(&master_key, &node_a_sync_sig, h_id).unwrap();
+            assert_op!(topic, id_to_name, 0, "A", false);
+            assert_op!(topic, id_to_name, 1, "B", false);
+            assert_op!(topic, id_to_name, 2, "C", false);
+            assert_op!(topic, id_to_name, 3, "D", false);
+            assert_op!(topic, id_to_name, 4, "E", false);
+            assert_op!(topic, id_to_name, 5, "F", false);
+            assert_op!(topic, id_to_name, 6, "G", false);
+            assert_op!(topic, id_to_name, 7, "H", false);
+            assert_op!(topic, id_to_name, 8, "I", false);
+            assert_op!(topic, id_to_name, 9, "J", true);
+            assert_eq!(
+                ids_to_names(&id_to_name, &topic.transactions()[9].snapshot().as_ref().unwrap().active_transactions()),
+                vec!["A", "G", "H", "I", "J"],
+            );
+            assert_op!(topic, id_to_name, 10, "K", false);
+            assert_op!(topic, id_to_name, 11, "L", false);
+            assert_op!(topic, id_to_name, 12, "M", false);
+            assert_eq!(topic.transactions().get(13), None);
             {
-                let mut operations = operations.clone();
-                let h_id = name_to_op.get("J").unwrap().id();
-                operations.snapshot(&master_key, &sign_key, h_id).unwrap();
-                assert_op!(operations, id_to_name, 0, "B", false);
-                assert_op!(operations, id_to_name, 1, "A", false);
-                assert_op!(operations, id_to_name, 2, "C", false);
-                assert_op!(operations, id_to_name, 3, "D", false);
-                assert_op!(operations, id_to_name, 4, "E", false);
-                assert_op!(operations, id_to_name, 5, "F", false);
-                assert_op!(operations, id_to_name, 6, "G", false);
-                assert_op!(operations, id_to_name, 7, "H", false);
-                assert_op!(operations, id_to_name, 8, "I", false);
-                assert_op!(operations, id_to_name, 9, "J", true);
-                assert_eq!(
-                    ids_to_names(&id_to_name, &operations.operations()[9].snapshot().as_ref().unwrap().active_transaction()),
-                    vec!["G", "H", "I", "J"],
-                );
-                assert_op!(operations, id_to_name, 10, "K", false);
-                assert_op!(operations, id_to_name, 11, "L", false);
-                assert_op!(operations, id_to_name, 12, "M", false);
-                assert_eq!(operations.operations().get(13), None);
-                let ordered = operations
-                    .order(&sign_key.clone().into())
+                let ordered = topic
+                    .get_transactions_ordered()
                     .unwrap()
                     .into_iter()
                     .map(|x| id_to_name.get(x.id()).unwrap())
                     .cloned()
                     .collect::<Vec<_>>();
-                assert_eq!(ordered, vec!["A", "C", "D", "E", "G", "H", "I", "K", "M"]);
+                assert_eq!(ordered, vec!["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]);
             }
         }
-
-        #[test]
-        fn operation_serde() {
-            let mut rng = rng::chacha20_seeded(
-                Hash::new_blake3(b"i definitely do NOT eat worms ahaha XD XD")
-                    .unwrap()
-                    .as_bytes()
-                    .try_into()
-                    .unwrap(),
-            );
-            let master_key = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
-            let sign_key = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
-
-            let action = OperationAction::Set(master_key.seal(&mut rng, b"TOP SECRET").unwrap());
-            let op_a = TopicTransaction::new(
-                &master_key,
-                &sign_key,
-                Timestamp::from_str("2020-01-01T00:00:01Z").unwrap(),
-                vec![TransactionID::from(Hash::new_blake3(b"zing").unwrap())],
-                action,
-            )
-            .unwrap();
-            let op_a_ser = op_a.serialize_binary().unwrap();
-            assert_eq!(
-                op_a_ser,
-                vec![
-                    48, 129, 228, 160, 36, 160, 34, 4, 32, 13, 233, 152, 222, 240, 83, 110, 231, 147, 180, 109, 95, 150, 199, 228, 111, 102,
-                    90, 171, 207, 171, 18, 38, 201, 51, 160, 207, 182, 245, 72, 172, 197, 161, 118, 48, 116, 160, 8, 2, 6, 1, 111, 94, 102,
-                    235, 232, 161, 38, 48, 36, 160, 34, 4, 32, 48, 245, 97, 247, 85, 38, 122, 249, 77, 217, 180, 151, 79, 222, 158, 225, 23,
-                    115, 176, 65, 95, 126, 7, 176, 130, 213, 116, 25, 25, 156, 82, 91, 162, 64, 160, 62, 48, 60, 160, 28, 160, 26, 4, 24, 196,
-                    105, 153, 92, 242, 84, 209, 71, 242, 90, 64, 229, 117, 104, 128, 199, 42, 198, 173, 213, 146, 9, 135, 123, 161, 28, 4, 26,
-                    153, 159, 221, 1, 168, 119, 95, 211, 141, 174, 62, 132, 131, 169, 191, 20, 219, 97, 165, 108, 52, 226, 43, 28, 237, 229,
-                    162, 68, 160, 66, 4, 64, 117, 161, 229, 148, 251, 222, 139, 161, 124, 113, 84, 139, 76, 167, 237, 11, 232, 241, 64, 239,
-                    66, 146, 103, 54, 0, 194, 66, 39, 69, 182, 32, 11, 98, 169, 149, 128, 132, 219, 218, 136, 107, 205, 80, 70, 166, 207, 41,
-                    175, 157, 12, 113, 98, 234, 76, 20, 29, 149, 13, 234, 189, 154, 252, 113, 10
-                ]
-            );
-
-            let op_b_ser = vec![
-                48, 130, 1, 10, 160, 36, 160, 34, 4, 32, 181, 194, 24, 63, 6, 132, 108, 158, 161, 111, 229, 107, 220, 29, 215, 142, 101, 231,
-                18, 237, 112, 194, 48, 221, 167, 45, 100, 220, 93, 151, 12, 132, 161, 129, 155, 48, 129, 152, 160, 8, 2, 6, 1, 111, 94, 102,
-                235, 232, 161, 74, 48, 72, 160, 34, 4, 32, 48, 245, 97, 247, 85, 38, 122, 249, 77, 217, 180, 151, 79, 222, 158, 225, 23, 115,
-                176, 65, 95, 126, 7, 176, 130, 213, 116, 25, 25, 156, 82, 91, 160, 34, 4, 32, 98, 136, 195, 216, 27, 32, 176, 102, 70, 179, 57,
-                127, 6, 100, 245, 153, 255, 60, 74, 109, 60, 238, 9, 61, 174, 50, 93, 12, 210, 152, 97, 12, 162, 64, 160, 62, 48, 60, 160, 28,
-                160, 26, 4, 24, 11, 133, 79, 196, 72, 22, 8, 243, 98, 172, 78, 198, 217, 165, 177, 176, 199, 131, 254, 163, 126, 155, 149, 172,
-                161, 28, 4, 26, 26, 237, 64, 124, 198, 145, 81, 173, 203, 170, 37, 103, 48, 194, 143, 128, 83, 247, 17, 115, 170, 114, 54, 119,
-                49, 250, 162, 68, 160, 66, 4, 64, 123, 77, 255, 54, 177, 240, 168, 205, 235, 132, 159, 2, 222, 117, 30, 35, 218, 250, 57, 96,
-                201, 248, 77, 184, 87, 152, 78, 67, 159, 230, 252, 201, 220, 127, 245, 239, 63, 254, 220, 37, 142, 175, 65, 147, 96, 166, 129,
-                26, 176, 193, 161, 182, 56, 224, 228, 23, 26, 238, 70, 191, 75, 183, 196, 6,
-            ];
-            let op_b = TopicTransaction::deserialize_binary(&op_b_ser).unwrap();
-            assert_eq!(
-                op_b.id().deref().as_bytes(),
-                &vec![
-                    181, 194, 24, 63, 6, 132, 108, 158, 161, 111, 229, 107, 220, 29, 215, 142, 101, 231, 18, 237, 112, 194, 48, 221, 167, 45,
-                    100, 220, 93, 151, 12, 132
-                ]
-            );
-            assert_eq!(op_b.entry().previous()[0], TransactionID::from(Hash::new_blake3(b"zing").unwrap()));
-            assert_eq!(op_b.entry().previous()[1], TransactionID::from(Hash::new_blake3(b"zong").unwrap()));
-            match op_b.entry().tx() {
-                OperationAction::Set(sealed) => {
-                    let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"poopy butt").unwrap().as_bytes().try_into().unwrap());
-                    let master_key2 = SecretKey::new_xchacha20poly1305(&mut rng).unwrap();
-                    assert_eq!(master_key2.open(&sealed).unwrap(), b"TOP SECRET");
-                }
-                _ => panic!("bad dates"),
-            }
-        }
-    */
+    }
 }

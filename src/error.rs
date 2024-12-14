@@ -20,8 +20,8 @@ pub enum Error {
     IdentityMissing(IdentityID),
 
     /// We tried to open a member rekey entry with a device id that it wasn't encrypted for.
-    #[error("missing member device {0:?}")]
-    MemberMissingDevice(DeviceID),
+    #[error("missing member device {0} / {1:?}")]
+    MemberMissingDevice(TransactionID, DeviceID),
 
     /// An operation on a member couldn't continue because they were not found.
     #[error("member not found: {0}")]
@@ -58,6 +58,14 @@ pub enum Error {
     /// A topic is missing some transactions. Be a dear and grab them, would you?
     #[error("topic is missing transactions: {0:?}")]
     TopicMissingTransactions(Vec<TransactionID>),
+
+    /// A topic secret entry is missing a needed transaction ID
+    #[error("topic secret is missing transaction id")]
+    TopicSecretMissingTransactionID,
+
+    /// A topic secret wasn't found under a certain transaction ID we expected to exist
+    #[error("topic secret required but not found for transaction {0}")]
+    TopicSecretNotFound(TransactionID),
 }
 
 /// Wraps `std::result::Result` around our `Error` enum
