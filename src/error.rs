@@ -55,6 +55,10 @@ pub enum Error {
     #[error("stamp error: {0}")]
     Stamp(#[from] stamp_core::error::Error),
 
+    /// A topic is missing a state object that we expected to be there.
+    #[error("topic is missing a state object for transaction {0}")]
+    TopicMissingState(TransactionID),
+
     /// A topic is missing some transactions. Be a dear and grab them, would you?
     #[error("topic is missing transactions: {0:?}")]
     TopicMissingTransactions(Vec<TransactionID>),

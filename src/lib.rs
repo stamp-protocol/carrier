@@ -14,7 +14,7 @@ use stamp_core::{
     identity::IdentityID,
     util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Deref;
 
 /// Defines a permission a member can have within a group.
@@ -40,7 +40,7 @@ pub enum Permission {
 }
 
 /// Represents a unique ID for a member device. Randomly generated.
-#[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[rasn(delegate)]
 pub struct DeviceID(Binary<16>);
 
@@ -269,7 +269,7 @@ impl MemberRekey {
     pub fn seal<R: RngCore + CryptoRng>(
         rng: &mut R,
         member: Member,
-        recipient_crypto_pubkeys: &HashMap<&DeviceID, &CryptoKeypairPublic>,
+        recipient_crypto_pubkeys: &BTreeMap<&DeviceID, &CryptoKeypairPublic>,
         secrets: Vec<SecretEntry>,
     ) -> Result<Self> {
         let secret_ser = secrets.serialize_binary()?;
@@ -282,7 +282,7 @@ impl MemberRekey {
                 #[allow(suspicious_double_ref_op)]
                 Ok((device_id.clone().clone(), msg))
             })
-            .collect::<Result<HashMap<_, _>>>()?
+            .collect::<Result<BTreeMap<_, _>>>()?
             .into();
         Ok(Self { member, secrets })
     }
@@ -369,6 +369,16 @@ pub enum Packet {
         #[rasn(tag(explicit(0)))]
         members: Vec<MemberRekey>,
     },
+}
+
+impl Packet {
+    /// Determine if this is a control packet (as opposed to a data packet).
+    pub fn is_control_packet(&self) -> bool {
+        match self {
+            Packet::MemberDevicesUpdate { .. } | Packet::MemberPermissionsChange { .. } | Packet::TopicRekey { .. } => true,
+            Packet::DataSet { .. } | Packet::DataUnset { .. } => false,
+        }
+    }
 }
 
 impl SerdeBinary for Packet {}
@@ -576,10 +586,7 @@ impl TopicTransaction {
 
     /// Returns whether or not this transaction houses a control packet.
     pub fn is_control_packet(&self) -> Result<bool> {
-        match self.get_packet()? {
-            Packet::MemberDevicesUpdate { .. } | Packet::MemberPermissionsChange { .. } | Packet::TopicRekey { .. } => Ok(true),
-            Packet::DataSet { .. } | Packet::DataUnset { .. } => Ok(false),
-        }
+        Ok(self.get_packet()?.is_control_packet())
     }
 
     /// Returns if this is an unset packet or not.
@@ -647,55 +654,74 @@ impl TopicID {
 
 impl SerdeBinary for TopicID {}
 
-/// A data topic. This is a structure built from running a DAG of transactions in order. It tracks
-/// the keys used to decrypt data contained in the topic, information on members of the topic and
-/// their permissions within the topic, as well as the data contained within the topic itself.
-#[derive(Clone, Debug, getset::Getters, getset::MutGetters, getset::Setters)]
+/// Holds secret and member state for a topic. A topic will generally have one or more copies of
+/// this, each corresponding to a branch/merge of the topic if eventual consistency finds us
+/// creating simultaneous updates in the DAG. These generally all get merged together in the
+/// topic's master state (`Topic.state`) however we use this master state mainly for authoring new
+/// transactions, NOT for validating old ones, because the old ones should be validated against the
+/// state corresponding to the branch they live in.
+///
+/// Imagine the following:
+///
+/// ```text
+///    A
+///  /  \
+/// B    C
+/// |    |
+/// D    E
+///  \  /
+///    F
+/// ```
+///
+/// Let's say `B` removes all participants' ability to post new transactions (except themself), but
+/// in the meantime, `C` & `E` are created on another branch that derives from `A`. `C`/`E` are
+/// *valid* in the context of `A`, but not in the context of `B`. If we were to just play the
+/// transactions in order and update a single state and validate off that state, `C`/`E` would get
+/// flagged as invalid, even though they are valid in the context of their state.
+///
+/// So the purpose of tracking per-branch state is to make sure that transactions that are valid
+/// given their ancestry will actually validate, as opposed to building a single global state and
+/// discarding transactions that might have been valid in their context but then get invalidated
+/// due to another branch. This of state tracking, although much more involved and less performant,
+/// significantly decreases the risk of causing invalid transactions. It's a much more permissive
+/// model. Yes, it's vulnerable to someone branching off of `E` to add their data and purposefully
+/// not including `B` or its descendants to avoid permissions adjustments. However, in the case of
+/// global state validation, someone malicious could just as easily branch off of `A` and remove
+/// everyone's ability to write transactions, which would invalidate the entire topic tree
+/// instantly...a much more devastating problem.
+///
+/// Given that topics are meant to be synced between known identities with a prior relationship, it
+/// makes sense that we use the permissive model that assumes mostly good actors.
+#[derive(Clone, Debug, Default, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct Topic {
-    /// This topic's unique ID
-    id: TopicID,
+pub struct TopicState {
     /// A collection of secret seeds, in order of the DAG control packets, that allow deriving the
     /// topic's current (or past) secret key(s).
     secrets: Vec<SecretEntry>,
-    /// This topic's keychain. This starts off empty and is populated as control packets come in
-    /// that give access to various identities via their sync keys. A new entry is created whenever
-    /// a member is added to or removed from the topic.
-    keychain: HashMap<TransactionID, SecretKey>,
     /// Tracks who is a member of this topic and what their permissions are.
     members: HashMap<IdentityID, Member>,
-    /// The actual transactions (control or data) in this topic.
-    transactions: Vec<TopicTransaction>,
 }
 
-impl Topic {
-    /// Create a new empty `Topic` object.
-    pub fn new(id: TopicID) -> Self {
-        Self {
-            id,
-            secrets: Vec::new(),
-            keychain: HashMap::new(),
-            members: HashMap::new(),
-            transactions: Vec::new(),
-        }
+impl TopicState {
+    /// Create anew
+    fn new() -> Self {
+        Default::default()
     }
 
-    /// Create a new `Topic` with the given transaction list.
-    ///
-    /// This takes a list of the full identities of the participants in the topic and a list of our
-    /// crypto keypairs and a) verifies each transaction against the identity it came from and b)
-    /// uses our crypto keypairs to decrypt any topic secrets in the control packets. This allows
-    /// us to full build our topic state.
-    pub fn new_from_transactions(
-        id: TopicID,
-        transactions: &[TopicTransaction],
-        identities: &HashMap<IdentityID, &Transactions>,
-        our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
-        our_identity_id: &IdentityID,
-        our_device_id: &DeviceID,
-    ) -> Result<Self> {
-        Self::new(id).push_transactions(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)
+    /// Check if the permissions on a transaction are valid.
+    pub fn check_permissions(
+        members: &HashMap<IdentityID, Member>,
+        permission: Permission,
+        identity_id: &IdentityID,
+        transaction_id: &TransactionID,
+    ) -> Result<()> {
+        let member = members
+            .get(identity_id)
+            .ok_or_else(|| Error::PermissionCheckFailed(transaction_id.clone(), permission.clone()))?;
+        if !member.permissions().contains(&permission) {
+            Err(Error::PermissionCheckFailed(transaction_id.clone(), permission))?;
+        }
+        Ok(())
     }
 
     /// Push a new secret into the topic
@@ -709,208 +735,56 @@ impl Topic {
         if secret_exists {
             return Ok(());
         }
-        let transaction_id = secret
-            .transaction_id()
-            .as_ref()
-            .ok_or_else(|| Error::TopicSecretMissingTransactionID)?
-            .clone();
-        let secret_key = secret.secret().derive_secret_key()?;
-        self.secrets_mut().push(secret);
-        self.keychain_mut().insert(transaction_id, secret_key);
+        self.secrets.push(secret);
         Ok(())
     }
 
-    /// Create a new packet that re-keys the topic.
-    ///
-    /// This does not apply the packet, it's your responsibility to call [`transaction_from_packet()`]
-    /// / [`push_transactions()`] yourself.
-    pub fn rekey<R: RngCore + CryptoRng>(
-        &self,
-        rng: &mut R,
-        members: Vec<(Member, &HashMap<&DeviceID, &CryptoKeypairPublic>)>,
-    ) -> Result<Packet> {
-        let mut secrets = self.secrets().clone();
-        secrets.push(SecretEntry::new_current_transaction(TopicSecret::new(rng)));
-        let rekeys = members
-            .into_iter()
-            .map(|(member, recipient_device_pubkeys)| MemberRekey::seal(rng, member, recipient_device_pubkeys, secrets.clone()))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Packet::TopicRekey { members: rekeys })
-    }
-
-    /// Returns the topic's current [`SecretKey`] (if the topic has any secret entries).
-    pub fn current_secret_key(&self) -> Result<Option<SecretKey>> {
-        self.secrets().last().map(|x| x.secret().derive_secret_key()).transpose()
-    }
-
-    /// Check if the permissions on a transaction are valid.
-    pub fn check_permissions(&self, permission: Permission, identity_id: &IdentityID, transaction_id: &TransactionID) -> Result<()> {
-        let member = self
-            .members()
-            .get(identity_id)
-            .ok_or_else(|| Error::PermissionCheckFailed(transaction_id.clone(), permission.clone()))?;
-        if !member.permissions().contains(&permission) {
-            Err(Error::PermissionCheckFailed(transaction_id.clone(), permission))?;
-        }
-        Ok(())
-    }
-
-    /// Push a set of *finalized* transactions into this topic, consuming the topic and returning a
-    /// new one with the transactions applied.
-    ///
-    /// This verifies the transactions at the top-level with their issuing identities, so have
-    /// those handy when calling. We also need to pass in our master key to unlock our crypto
-    /// keypairs, allowing us to apply key changes in the topic sent to us.
-    pub fn push_transactions(
-        mut self,
-        transactions: &[TopicTransaction],
-        identities: &HashMap<IdentityID, &Transactions>,
-        our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
-        our_identity_id: &IdentityID,
-        our_device_id: &DeviceID,
-    ) -> Result<Self> {
-        self.push_transactions_mut(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
-        Ok(self)
-    }
-
-    /// Allows staging a transaction (adding it to a clone of our current accepted transaction list
-    /// and aplying its changes to see if they're valid). If everything checks out, we return a new
-    /// topic with all transactions (including the pushed one) run in-order and the state
-    /// reflecting these transactions.
-    pub fn push_transactions_mut(
-        &mut self,
-        transactions: &[TopicTransaction],
-        identities: &HashMap<IdentityID, &Transactions>,
-        our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
-        our_identity_id: &IdentityID,
-        our_device_id: &DeviceID,
-    ) -> Result<bool> {
-        // index transactions we've alrady processed here
-        let mut exists_idx: HashSet<&TransactionID> = HashSet::new();
-        let nodes_old = self
-            .transactions()
-            .iter()
-            .map(|x| {
-                exists_idx.insert(x.id());
-                x.into()
-            })
-            .collect::<Vec<DagNode<_, _>>>();
-        let nodes_new = transactions
-            .iter()
-            // don't re-run transactions we've already processed
-            .filter(|n| !exists_idx.contains(n.id()))
-            .map(|x| x.into())
-            .collect::<Vec<_>>();
-
-        // verify our transactions against their respective identities
-        for trans in transactions {
-            let trans_identity_id = trans.identity_id()?;
-            let prev = trans.transaction().entry().previous_transactions();
-            let identity_tx = identities
-                .get(trans_identity_id)
-                .ok_or_else(|| Error::IdentityMissing(trans_identity_id.clone()))?;
-            let identity = identity_tx.build_identity_at_point_in_history(&prev)?;
-            trans.transaction().verify(Some(&identity))?;
-        }
-
-        let visited: Vec<&TopicTransaction> = {
-            let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_old, &nodes_new]);
-            if dag.missing().len() > 0 {
-                Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
-            }
-            dag.visited()
-                .iter()
-                .map(|tid| {
-                    #[allow(suspicious_double_ref_op)]
-                    dag.index()
-                        .get(tid)
-                        .map(|t| *t.node())
-                        .ok_or_else(|| Error::TopicMissingTransactions(vec![tid.clone().clone()]))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        let mut found_control = false;
-        let transactions_since_last_control = self
-            .transactions()
-            .iter()
-            .rev()
-            .filter(|trans| {
-                let last_found_control = found_control;
-                if let Ok(packet) = trans.get_packet() {
-                    match packet {
-                        Packet::MemberDevicesUpdate { .. } | Packet::MemberPermissionsChange { .. } | Packet::TopicRekey { .. } => {
-                            found_control = true;
-                        }
-                        Packet::DataSet { .. } | Packet::DataUnset { .. } => {}
-                    }
-                }
-                !last_found_control
-            })
-            .map(|t| t.id())
-            .collect::<HashSet<_>>();
-        let new_nodes_id_set = nodes_new.iter().map(|t| t.id()).collect::<HashSet<_>>();
-        let new_nodes_prev_list = nodes_new
-            .iter()
-            .map(|t| t.node().previous_transactions().unwrap_or_else(|_| Vec::new()))
-            .fold(Vec::new(), |mut acc, mut x| {
-                acc.append(&mut x);
-                acc
-            });
-        let mut new_nodes_only_reference_nodes_since_latest_control = true;
-        for prev in new_nodes_prev_list {
-            if !transactions_since_last_control.contains(prev) {
-                new_nodes_only_reference_nodes_since_latest_control = false;
-                break;
-            }
-        }
-        // if our new nodes only reference nodes since the last control, we can happily just run
-        // them on top of our current topic state.
-        //
-        // if our new nodes reference transactions BEFORE the latest control packet, we've got to
-        // rebuild our entire state from the beginning.
-        let apply = if new_nodes_only_reference_nodes_since_latest_control {
-            let mut apply = Vec::with_capacity(nodes_new.len());
-            for trans in visited {
-                if new_nodes_id_set.contains(&trans.id()) {
-                    apply.push(trans.clone());
-                }
-            }
-            apply
-        } else {
-            visited.iter().cloned().cloned().collect::<Vec<_>>()
-        };
-        for trans in apply {
-            self.apply_transaction(trans, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
-        }
-        Ok(new_nodes_only_reference_nodes_since_latest_control)
-    }
-
-    /// Push a new [`TopicTransaction`] into this topic.
-    fn apply_transaction<'a>(
-        &'a mut self,
-        transaction: TopicTransaction,
-        our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
-        our_identity_id: &IdentityID,
-        our_device_id: &DeviceID,
-    ) -> Result<&TopicTransaction> {
-        let is_initial_packet = self.transactions().len() == 0;
+    /// Validate a transaction against the current state (meaning, check permissions).
+    fn validate_transaction(&self, transaction: &TopicTransaction) -> Result<()> {
+        let is_initial_packet = transaction.previous_transactions()?.len() == 0;
 
         let packet = transaction.get_packet()?;
         let identity_id = transaction.identity_id()?;
         match packet {
             Packet::DataSet { .. } => {
-                self.check_permissions(Permission::DataSet, &identity_id, transaction.id())?;
+                Self::check_permissions(self.members(), Permission::DataSet, &identity_id, transaction.id())?;
             }
             Packet::DataUnset { .. } => {
-                self.check_permissions(Permission::DataUnset, &identity_id, transaction.id())?;
+                Self::check_permissions(self.members(), Permission::DataUnset, &identity_id, transaction.id())?;
+            }
+            Packet::MemberDevicesUpdate { .. } => {
+                Self::check_permissions(self.members(), Permission::MemberDevicesUpdate, &identity_id, transaction.id())?;
+            }
+            Packet::MemberPermissionsChange { .. } => {
+                Self::check_permissions(self.members(), Permission::MemberPermissionsChange, &identity_id, transaction.id())?;
+            }
+            Packet::TopicRekey { .. } => {
+                if !is_initial_packet {
+                    Self::check_permissions(self.members(), Permission::TopicRekey, &identity_id, transaction.id())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a previously-validated transaction to this state.
+    fn apply_transaction(
+        &mut self,
+        transaction: &TopicTransaction,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<()> {
+        let packet = transaction.get_packet()?;
+        let identity_id = transaction.identity_id()?;
+        match packet {
+            Packet::DataSet { .. } => {}
+            Packet::DataUnset { .. } => {
                 // TODO:
                 // - don't allow Unset on non-data packets
             }
             Packet::MemberDevicesUpdate { devices } => {
-                self.check_permissions(Permission::MemberDevicesUpdate, &identity_id, transaction.id())?;
                 self.members_mut()
                     .get_mut(identity_id)
                     .map(|member| {
@@ -922,7 +796,6 @@ impl Topic {
                 identity_id: identity_id_changee,
                 permissions: new_permissions,
             } => {
-                self.check_permissions(Permission::MemberPermissionsChange, &identity_id, transaction.id())?;
                 if !self.members().contains_key(&identity_id_changee) {
                     Err(Error::MemberNotFound(identity_id_changee.clone()))?;
                 }
@@ -942,9 +815,6 @@ impl Topic {
                     .ok_or_else(|| Error::MemberNotFound(identity_id_changee))?;
             }
             Packet::TopicRekey { members } => {
-                if !is_initial_packet {
-                    self.check_permissions(Permission::TopicRekey, &identity_id, transaction.id())?;
-                }
                 // every rekey necessarily rebuilds the entire member set
                 self.members_mut().clear();
                 for member_rekey in members {
@@ -953,8 +823,6 @@ impl Topic {
                     let member = if rekey_is_relevant_to_us {
                         let (member, secrets) = member_rekey.open(our_master_key, our_crypto_keypairs, our_device_id, transaction.id())?;
                         for mut secret in secrets {
-                            self.keychain_mut()
-                                .insert(transaction.id().clone(), secret.secret().derive_secret_key()?);
                             if secret.transaction_id().is_none() {
                                 // make sure the secret entry gets set to the current transaction
                                 // *if its transaction_id field is empty*
@@ -966,12 +834,287 @@ impl Topic {
                     } else {
                         member_rekey.consume()
                     };
-                    self.members.insert(member.identity_id().clone(), member);
+                    self.members_mut().insert(member.identity_id().clone(), member);
                 }
             }
         }
-        self.transactions_mut().push(transaction);
-        Ok(self.transactions().last().unwrap())
+        Ok(())
+    }
+}
+
+/// Determines how the DAG of a [`Topic`] was modified while pushing transactions.
+///
+/// You can probably generally ignore this unless you're hitting performance issues, in which case
+/// you'll want to investigate why your DAG is branching so much.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicDagState {
+    /// The DAG was rebuilt from scratch. This happens when new transactions reference (or branch
+    /// off of) non-tail nodes, ie nodes that are in the middle of the chain somewhere as opposed
+    /// to the end of the chain.
+    ///
+    /// When this branching happens, it's necessary to re-run the DAG from scratch which can be an
+    /// expensive operation, depending on how many updates there are.
+    DagRebuilt,
+    /// The DAG was incrementally updated. This is the most efficient operational mode and
+    /// hopefully the most common for any given use-case.
+    DagUpdated,
+}
+
+/// A data topic. This is a structure built from running a DAG of transactions in order. It tracks
+/// the keys used to decrypt data contained in the topic, information on members of the topic and
+/// their permissions within the topic, as well as the data contained within the topic itself.
+#[derive(Clone, Debug, getset::Getters, getset::MutGetters, getset::Setters)]
+#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
+pub struct Topic {
+    /// This topic's unique ID
+    id: TopicID,
+    /// This topic's global state.
+    state: TopicState,
+    /// This topic's keychain. This starts off empty and is populated as control packets come in
+    /// that give access to various identities via their sync keys. A new entry is created whenever
+    /// a member is added to or removed from the topic.
+    keychain: HashMap<TransactionID, SecretKey>,
+    /// The actual transactions (control or data) in this topic.
+    transactions: Vec<TopicTransaction>,
+    /// Tracks the state for the various branches in the topic DAG we can have, allowing
+    /// transactions to have branch-local validation as opposed to requiring consistent state. This
+    /// mapping exists largely as a cache so we don't have to re-run all the transactions from
+    /// start to finish each time we need to add a new transaction to the topic.
+    branch_state: HashMap<TransactionID, TopicState>,
+    /// Tracks the tail references of the most recent state update to the topic DAG. You mostly
+    /// shouldn't think about this at all since its function is purely for internal optimization.
+    last_tail_nodes: Vec<TransactionID>,
+}
+
+impl Topic {
+    /// Create a new empty `Topic` object.
+    pub fn new(id: TopicID) -> Self {
+        Self {
+            id,
+            state: TopicState::new(),
+            keychain: HashMap::new(),
+            transactions: Vec::new(),
+            branch_state: HashMap::new(),
+            last_tail_nodes: Vec::new(),
+        }
+    }
+
+    /// Create a new `Topic` with the given transaction list.
+    ///
+    /// This takes a list of the full identities of the participants in the topic and a list of our
+    /// crypto keypairs and a) verifies each transaction against the identity it came from and b)
+    /// uses our crypto keypairs to decrypt any topic secrets in the control packets. This allows
+    /// us to full build our topic state.
+    pub fn new_from_transactions(
+        id: TopicID,
+        transactions: Vec<TopicTransaction>,
+        identities: &HashMap<IdentityID, &Transactions>,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<Self> {
+        Self::new(id).push_transactions(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)
+    }
+
+    /// Return a ref to this topic's secret collection
+    pub fn secrets(&self) -> &Vec<SecretEntry> {
+        self.state().secrets()
+    }
+
+    /// Create a new packet that re-keys the topic.
+    ///
+    /// This does not apply the packet, it's your responsibility to call [`Topic::transaction_from_packet()`]
+    /// / [`Topic::push_transactions()`] yourself.
+    pub fn rekey<R: RngCore + CryptoRng>(
+        &self,
+        rng: &mut R,
+        members: Vec<(Member, &BTreeMap<&DeviceID, &CryptoKeypairPublic>)>,
+    ) -> Result<Packet> {
+        let mut secrets = self.secrets().clone();
+        secrets.push(SecretEntry::new_current_transaction(TopicSecret::new(rng)));
+        let rekeys = members
+            .into_iter()
+            .map(|(member, recipient_device_pubkeys)| MemberRekey::seal(rng, member, recipient_device_pubkeys, secrets.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Packet::TopicRekey { members: rekeys })
+    }
+
+    /// Returns the topic's current [`SecretKey`] (if the topic has any secret entries).
+    pub fn current_secret_key(&self) -> Result<Option<SecretKey>> {
+        self.secrets().last().map(|x| x.secret().derive_secret_key()).transpose()
+    }
+
+    /// Push a set of *finalized* transactions into this topic, consuming the topic and returning a
+    /// new one with the transactions applied.
+    ///
+    /// This verifies the transactions at the top-level with their issuing identities, so have
+    /// those handy when calling. We also need to pass in our master key to unlock our crypto
+    /// keypairs, allowing us to apply key changes in the topic sent to us.
+    pub fn push_transactions(
+        mut self,
+        transactions: Vec<TopicTransaction>,
+        identities: &HashMap<IdentityID, &Transactions>,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<Self> {
+        self.push_transactions_mut(transactions, identities, our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
+        Ok(self)
+    }
+
+    /// Push a set of *finalized* transactions into this topic, consuming the topic and returning a
+    /// new one with the transactions applied.
+    ///
+    /// This verifies the transactions at the top-level with their issuing identities, so have
+    /// those handy when calling. We also need to pass in our master key to unlock our crypto
+    /// keypairs, allowing us to apply key changes in the topic sent to us.
+    ///
+    /// This is exactly like [`Topic::push_transactions()`] but works without consuming the topic.
+    pub fn push_transactions_mut(
+        &mut self,
+        transactions: Vec<TopicTransaction>,
+        identities: &HashMap<IdentityID, &Transactions>,
+        our_master_key: &SecretKey,
+        our_crypto_keypairs: &[&CryptoKeypair],
+        our_identity_id: &IdentityID,
+        our_device_id: &DeviceID,
+    ) -> Result<TopicDagState> {
+        // index transactions we've already processed here
+        let mut exists_idx: HashSet<&TransactionID> = HashSet::new();
+        let nodes_old = self
+            .transactions()
+            .iter()
+            .map(|x| {
+                exists_idx.insert(x.id());
+                x.into()
+            })
+            .collect::<Vec<DagNode<_, _>>>();
+        let mut nodes_new_idx = transactions
+            .into_iter()
+            .filter(|t| !exists_idx.contains(t.id()))
+            .map(|t| (t.id().clone(), t))
+            .collect::<HashMap<TransactionID, TopicTransaction>>();
+        let mut contains_key_changes = false;
+        for trans in nodes_new_idx.values() {
+            // verify our transactions against their respective identities
+            let trans_identity_id = trans.identity_id()?;
+            let prev = trans.transaction().entry().previous_transactions();
+            let identity_tx = identities
+                .get(trans_identity_id)
+                .ok_or_else(|| Error::IdentityMissing(trans_identity_id.clone()))?;
+            let identity = identity_tx.build_identity_at_point_in_history(&prev)?;
+            trans.transaction().verify(Some(&identity))?;
+            // also, look for any key changes
+            match trans.get_packet()? {
+                Packet::TopicRekey { .. } => {
+                    contains_key_changes = true;
+                }
+                _ => {}
+            }
+        }
+
+        // if our new transactions *only* reference either tail nodes in the existing DAG OR
+        // each other, then we can safely update this DAG using the existing state tracking and
+        // skip a whole lot of processing. however, if our new nodes reference any non-tail,
+        // non-new state, then we need to re-process the entire DAG.
+        let new_transactions_only_reference_tail_nodes = {
+            // index our DAG's tail transactions AND our new transactions into a set that we'll
+            // use to check if we need to re-run the entire DAG.
+            let mut tail_or_self_idx = self.last_tail_nodes.iter().collect::<HashSet<_>>();
+            for trans in nodes_new_idx.values() {
+                tail_or_self_idx.insert(trans.id());
+            }
+            // now loop over our new transactions and check the previous_transactions of each,
+            // looking for any references to tx outside of our tail/new set. if we find any,
+            // we've got to reprocess the DAG =[ =[ =[. sad!
+            let mut only_tail_referenced = true;
+            for trans in nodes_new_idx.values() {
+                let prev = trans.previous_transactions()?;
+                for txid in prev {
+                    if !tail_or_self_idx.contains(txid) {
+                        only_tail_referenced = false;
+                        break;
+                    }
+                }
+                if !only_tail_referenced {
+                    break;
+                }
+            }
+            only_tail_referenced
+        };
+
+        let mut branch_state = if new_transactions_only_reference_tail_nodes {
+            self.branch_state().clone()
+        } else {
+            HashMap::new()
+        };
+
+        let (global_state, last_tail_nodes) = {
+            let nodes_new = nodes_new_idx
+                .values()
+                // don't re-run transactions we've already processed
+                .filter(|n| !exists_idx.contains(n.id()))
+                .map(|x| x.into())
+                .collect::<Vec<_>>();
+
+            let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_old, &nodes_new]);
+            if dag.missing().len() > 0 {
+                Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
+            }
+
+            let global_state = dag.apply(
+                &mut branch_state,
+                |node| {
+                    let mut state = TopicState::new();
+                    state.apply_transaction(node.node(), our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
+                    Ok(state)
+                },
+                |node| new_transactions_only_reference_tail_nodes && exists_idx.contains(node.id()),
+                |state, node| state.validate_transaction(node.node()),
+                |state, node| state.apply_transaction(node.node(), our_master_key, our_crypto_keypairs, our_identity_id, our_device_id),
+            )?;
+            (global_state, dag.tail().clone().into_iter().cloned().collect())
+        };
+        for (_, trans) in nodes_new_idx.drain() {
+            self.transactions.push(trans);
+        }
+        // save our global state into the topic. this is our state with every known transaction
+        // applied to it, which gives a final look at the current state of the topic.
+        self.set_state(global_state.clone());
+        // save all of our various branch states back into the topic.
+        self.set_branch_state(branch_state);
+        // save our last tail nodes so we don't have to build our DAG *twice* next time (once with
+        // just the existing transactions to get the tail nodes, and again with the existing AND
+        // new transactions to get the final state)
+        self.set_last_tail_nodes(last_tail_nodes);
+        if !new_transactions_only_reference_tail_nodes || contains_key_changes {
+            // regenerate our keychain, which helps us decrypt our heroic data transactions
+            self.generate_keychain()?;
+        }
+        let dag_state = if new_transactions_only_reference_tail_nodes {
+            TopicDagState::DagUpdated
+        } else {
+            TopicDagState::DagRebuilt
+        };
+        Ok(dag_state)
+    }
+
+    fn generate_keychain(&mut self) -> Result<()> {
+        let keychain = self
+            .state()
+            .secrets()
+            .iter()
+            .filter_map(|s| {
+                s.transaction_id()
+                    .as_ref()
+                    .map(|txid| (txid.clone(), s.secret().derive_secret_key()))
+            })
+            .map(|(txid, res)| Ok((txid, res?)))
+            .collect::<Result<HashMap<_, _>>>()?;
+        self.set_keychain(keychain);
+        Ok(())
     }
 
     /// Find operations that are not referenced in any other operation's `previous` list.
@@ -1017,7 +1160,7 @@ impl Topic {
         Ok(trans)
     }
 
-    /// Return this operation set as a [`Dag`], which provides information on the structure of the
+    /// Return this topic as a [`Dag`], which provides information on the structure of the
     /// DAG itself (missing nodes, unvisited/unreachable nodes) and also allows
     /// [walking][Dag::walk].
     pub fn as_dag<'a>(transactions: &'a [TopicTransaction]) -> Dag<'a, TransactionID, TopicTransaction> {
@@ -1195,7 +1338,7 @@ impl Topic {
     /// operations, but rather just the ones that causally happened before the `replaces`
     /// operation. In other words, given:
     ///
-    /// ```ignore
+    /// ```text
     /// A -> B -> C \
     ///              -> G -> H
     /// D -> E -> F /
@@ -1404,7 +1547,7 @@ pub(crate) mod tests {
     }
 
     #[allow(dead_code)]
-    fn dump_tx(id_to_name: &HashMap<TransactionID, &'static str>, transactions: &[Transaction]) {
+    fn dump_tx_(id_to_name: &HashMap<TransactionID, &'static str>, transactions: &[Transaction]) {
         for tx in transactions {
             println!("- idx: {} -> {}", id_to_name.get(tx.id()).unwrap(), tx.id());
             match tx.entry().body() {
@@ -1421,6 +1564,26 @@ pub(crate) mod tests {
     #[allow(dead_code)]
     fn ids_to_names(map: &HashMap<TransactionID, &'static str>, ops: &[&TransactionID]) -> Vec<&'static str> {
         ops.iter().map(|x| map.get(x).cloned().unwrap_or("??")).collect::<Vec<_>>()
+    }
+
+    #[allow(dead_code)]
+    fn dump_tx(tx: &[(&'static str, &Transaction)]) {
+        let name_map = tx.iter().map(|(name, tx)| (tx.id().clone(), name)).collect::<HashMap<_, _>>();
+        for (name, trans) in tx {
+            #[allow(suspicious_double_ref_op)]
+            let tt = TopicTransaction::new(trans.clone().clone());
+            let next = tt
+                .previous_transactions()
+                .expect("previous_transactions()")
+                .iter()
+                .map(|prev| {
+                    let name = name_map.get(prev).unwrap_or(&&"<null>");
+                    format!("{}", name)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("- {} -- {}    prev: [{}]", trans.id(), name, next);
+        }
     }
 
     fn packet_body(
@@ -1620,11 +1783,12 @@ pub(crate) mod tests {
             self.tx(now, prev, packet)
         }
 
-        fn push_tx(&self, identities: &HashMap<IdentityID, &Transactions>, transactions: &[Transaction]) -> Result<()> {
-            let topic_tx = transactions.iter().map(|t| t.clone().into()).collect::<Vec<_>>();
+        fn push_tx(&self, identities: &HashMap<IdentityID, &Transactions>, transactions: &[&Transaction]) -> Result<TopicDagState> {
+            let topic_tx = transactions.iter().cloned().map(|t| t.clone().into()).collect::<Vec<_>>();
             let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
-            let topic = self.topic.replace(fake_topic).push_transactions(
-                &topic_tx[..],
+            let mut topic = self.topic.replace(fake_topic);
+            let dag_state = topic.push_transactions_mut(
+                topic_tx,
                 identities,
                 self.master_key(),
                 &self.crypto_keys().iter().collect::<Vec<_>>(),
@@ -1634,7 +1798,7 @@ pub(crate) mod tests {
             // take the topic out of the peer so we can mutate it without the borrow checker
             // blowing a gasket
             self.topic.replace(topic);
-            Ok(())
+            Ok(dag_state)
         }
     }
 
@@ -1654,16 +1818,8 @@ pub(crate) mod tests {
             .map(|t| TopicTransaction::new(t))
             .collect::<Vec<_>>();
         let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
-        Topic::new_from_transactions(
-            topic_id.clone(),
-            &transactions[..],
-            &identity_map,
-            master_key,
-            &[&crypto_key],
-            &identity_id,
-            device_id,
-        )
-        .unwrap()
+        Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[&crypto_key], &identity_id, device_id)
+            .unwrap()
     }
 
     #[test]
@@ -1693,7 +1849,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -1725,14 +1881,7 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>();
             let identity_id = transactions.identity_id().unwrap();
             let identity_map = HashMap::from([(identity_id.clone(), &transactions)]);
-            topic.push_transactions_mut(
-                &txt[..],
-                &identity_map,
-                &master_key,
-                &[&node_a_sync_crypto],
-                &identity_id,
-                member.devices()[0].id(),
-            )
+            topic.push_transactions_mut(txt, &identity_map, &master_key, &[&node_a_sync_crypto], &identity_id, member.devices()[0].id())
         };
         {
             let mut topic = Topic::new(topic_id.clone());
@@ -1811,7 +1960,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -1886,11 +2035,11 @@ pub(crate) mod tests {
         }
 
         // creates a device_id -> crypto pubkey mapping
-        fn device_lookup<'a>(packets: &[&'a KeyPacket]) -> HashMap<&'a DeviceID, &'a CryptoKeypairPublic> {
+        fn device_lookup<'a>(packets: &[&'a KeyPacket]) -> BTreeMap<&'a DeviceID, &'a CryptoKeypairPublic> {
             packets
                 .iter()
                 .map(|p| (p.entry().device_id(), p.entry().pubkey()))
-                .collect::<HashMap<_, _>>()
+                .collect::<BTreeMap<_, _>>()
         }
 
         macro_rules! topicdata {
@@ -1982,7 +2131,7 @@ pub(crate) mod tests {
 
         // make sure we can only add transactions from identities we've indexed
         {
-            let res = butch_laptop.push_tx(&id_lookup(&[]), &[genesis.clone()]);
+            let res = butch_laptop.push_tx(&id_lookup(&[]), &[&genesis]);
             match res {
                 Err(Error::IdentityMissing(id)) => {
                     assert_eq!(id, butch_laptop.identity().identity_id().unwrap());
@@ -1990,7 +2139,7 @@ pub(crate) mod tests {
                 _ => panic!("unexpected: {:?}", res),
             }
         }
-        butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[genesis.clone()]).unwrap();
+        butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[&genesis]).unwrap();
 
         assert_eq!(butch_laptop.topic().secrets().len(), 1);
         assert_eq!(butch_phone.topic().secrets().len(), 0);
@@ -2005,7 +2154,7 @@ pub(crate) mod tests {
         assert_eq!(txids!(&frankie_phone), empty_tx);
 
         let data1 = butch_laptop.tx_data(ts("2024-12-08T01:00:01Z"), AppData::new("hi i'm butch"), None, None);
-        butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[data1.clone()]).unwrap();
+        butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[&data1]).unwrap();
         assert_eq!(butch_laptop.topic().secrets().len(), 1);
 
         let rekey1 = {
@@ -2028,11 +2177,12 @@ pub(crate) mod tests {
         assert_eq!(jerry_laptop.topic().secrets().len(), 0);
         assert_eq!(frankie_phone.topic().secrets().len(), 0);
         butch_laptop
-            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[genesis.clone(), rekey1.clone()])
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&genesis, &rekey1])
             .unwrap();
         dotty_laptop
-            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data1.clone(), genesis.clone(), rekey1.clone()])
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data1, &genesis, &rekey1])
             .unwrap();
+
         assert_eq!(butch_laptop.topic().secrets().len(), 2);
         assert_eq!(butch_phone.topic().secrets().len(), 0);
         assert_eq!(dotty_laptop.topic().secrets().len(), 2);
@@ -2052,7 +2202,7 @@ pub(crate) mod tests {
                 let butch_phone = butch_phone.clone();
                 // try to push transactions without having butch in the id list.
                 {
-                    let res = butch_phone.push_tx(&id_lookup(&[&dotty_laptop]), &[genesis.clone(), rekey1.clone(), data1.clone()]);
+                    let res = butch_phone.push_tx(&id_lookup(&[&dotty_laptop]), &[&genesis, &rekey1, &data1]);
                     match res {
                         Err(Error::IdentityMissing(ref id)) => {
                             assert_eq!(id, &butch_laptop.identity().identity_id().unwrap());
@@ -2074,10 +2224,7 @@ pub(crate) mod tests {
                     // really we have no good way of detecting missing secrets until we try to grab
                     // our data.
                     jerry_laptop
-                        .push_tx(
-                            &id_lookup(&[&butch_laptop, &dotty_laptop, &jerry_laptop]),
-                            &[genesis.clone(), rekey1.clone(), data1.clone()],
-                        )
+                        .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop, &jerry_laptop]), &[&genesis, &rekey1, &data1])
                         .unwrap();
                     // this should fail
                     let res = topicdata!(jerry_laptop);
@@ -2095,7 +2242,7 @@ pub(crate) mod tests {
         // already and is going to set it as the prev to data2.
         let data2 = dotty_laptop.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("dotty is best"), None, None);
         dotty_laptop
-            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data2.clone()])
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data2])
             .unwrap();
         assert_eq!(butch_laptop.topic().secrets().len(), 2);
         assert_eq!(butch_phone.topic().secrets().len(), 0);
@@ -2111,7 +2258,7 @@ pub(crate) mod tests {
 
         let data3 = dotty_laptop.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("it is plain to see"), None, None);
         dotty_laptop
-            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data3.clone()])
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data3])
             .unwrap();
 
         assert_eq!(topicdata!(butch_laptop).unwrap(), vec![AppData::new("hi i'm butch")]);
@@ -2130,7 +2277,7 @@ pub(crate) mod tests {
         // test out of roerd packets
         {
             let butch_laptop = butch_laptop.clone();
-            let res = butch_laptop.push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data3.clone()]);
+            let res = butch_laptop.push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data3]);
             // should give us a list of transactions we need to complete the chain
             match res {
                 Err(Error::TopicMissingTransactions(txids)) => {
@@ -2141,7 +2288,7 @@ pub(crate) mod tests {
         }
 
         butch_laptop
-            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[data3.clone(), data2.clone()])
+            .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data3, &data2])
             .unwrap();
         assert_eq!(
             topicdata!(butch_laptop).unwrap(),
@@ -2185,25 +2332,15 @@ pub(crate) mod tests {
 
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[rekey2.clone()]).unwrap();
-            dotty_laptop.push_tx(&all_ids_lookup, &[rekey2.clone()]).unwrap();
+            butch_laptop.push_tx(&all_ids_lookup, &[&rekey2]).unwrap();
+            dotty_laptop.push_tx(&all_ids_lookup, &[&rekey2]).unwrap();
             assert_eq!(butch_laptop.topic().secrets().len(), 3);
             assert_eq!(butch_phone.topic().secrets().len(), 0);
             assert_eq!(dotty_laptop.topic().secrets().len(), 3);
             assert_eq!(jerry_laptop.topic().secrets().len(), 0);
             assert_eq!(frankie_phone.topic().secrets().len(), 0);
             butch_phone
-                .push_tx(
-                    &all_ids_lookup,
-                    &[
-                        genesis.clone(),
-                        rekey1.clone(),
-                        rekey2.clone(),
-                        data1.clone(),
-                        data2.clone(),
-                        data3.clone(),
-                    ],
-                )
+                .push_tx(&all_ids_lookup, &[&genesis, &rekey1, &rekey2, &data1, &data2, &data3])
                 .unwrap();
             assert_eq!(butch_laptop.topic().secrets().len(), 3);
             assert_eq!(butch_phone.topic().secrets().len(), 3);
@@ -2240,30 +2377,10 @@ pub(crate) mod tests {
 
             // now catch up everyone in the gang
             jerry_laptop
-                .push_tx(
-                    &all_ids_lookup,
-                    &[
-                        genesis.clone(),
-                        rekey1.clone(),
-                        rekey2.clone(),
-                        data1.clone(),
-                        data2.clone(),
-                        data3.clone(),
-                    ],
-                )
+                .push_tx(&all_ids_lookup, &[&genesis, &rekey1, &rekey2, &data1, &data2, &data3])
                 .unwrap();
             frankie_phone
-                .push_tx(
-                    &all_ids_lookup,
-                    &[
-                        genesis.clone(),
-                        rekey1.clone(),
-                        rekey2.clone(),
-                        data1.clone(),
-                        data2.clone(),
-                        data3.clone(),
-                    ],
-                )
+                .push_tx(&all_ids_lookup, &[&genesis, &rekey1, &rekey2, &data1, &data2, &data3])
                 .unwrap();
         }
 
@@ -2328,7 +2445,7 @@ pub(crate) mod tests {
                 permissions: vec![],
             },
         );
-        dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[perms1.clone()]).unwrap();
+        dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[&perms1]).unwrap();
         let perms2 = dotty_laptop.tx(
             ts("2024-12-09T18:00:01Z"),
             None,
@@ -2337,32 +2454,33 @@ pub(crate) mod tests {
                 permissions: vec![],
             },
         );
-        dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[perms2.clone()]).unwrap();
+        dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[&perms2]).unwrap();
 
         let data4 = jerry_laptop.tx_data(ts("2024-12-10T00:00:00Z"), AppData::new("jerry reporting in"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
-            butch_phone.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
-            jerry_laptop.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
-            frankie_phone.push_tx(&all_ids_lookup, &[data4.clone()]).unwrap();
+            butch_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap();
+            butch_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap();
+            jerry_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap();
+            frankie_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap();
         }
         let data5 = jerry_laptop.tx_data(ts("2024-12-10T00:01:00Z"), AppData::new("just saw a cat"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
-            butch_phone.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
-            jerry_laptop.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
-            frankie_phone.push_tx(&all_ids_lookup, &[data5.clone()]).unwrap();
+            butch_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap();
+            butch_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap();
+            jerry_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap();
+            frankie_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap();
         }
         let data6 = frankie_phone.tx_data(ts("2024-12-10T00:02:00Z"), AppData::new("i hate cats"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
-            butch_phone.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
-            jerry_laptop.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
-            frankie_phone.push_tx(&all_ids_lookup, &[data6.clone()]).unwrap();
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
         }
+
         assert_eq!(
             topicdata!(butch_laptop).unwrap(),
             vec![
@@ -2419,14 +2537,17 @@ pub(crate) mod tests {
         // now we combine our hot branches with a cool island merge
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
-            butch_phone.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
-            dotty_laptop
-                .push_tx(&all_ids_lookup, &[data4.clone(), data5.clone(), data6.clone()])
-                .unwrap();
-            jerry_laptop.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
-            frankie_phone.push_tx(&all_ids_lookup, &[perms1.clone(), perms2.clone()]).unwrap();
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
+            assert_eq!(dotty_laptop.push_tx(&all_ids_lookup, &[&data4, &data5, &data6]).unwrap(), TopicDagState::DagRebuilt);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
         }
+    }
+
+    #[test]
+    fn topic_branch_with_snapshot() {
+        todo!("Test what happens when multiple transaction branches are snapshotted and merged");
     }
 
     #[test]
@@ -2456,7 +2577,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -2531,7 +2652,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &HashMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
