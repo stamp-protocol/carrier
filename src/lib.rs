@@ -1052,30 +1052,33 @@ impl Topic {
         };
 
         let (global_state, last_tail_nodes) = {
-            let nodes_new = nodes_new_idx
-                .values()
-                // don't re-run transactions we've already processed
-                .filter(|n| !exists_idx.contains(n.id()))
-                .map(|x| x.into())
-                .collect::<Vec<_>>();
+            self.with_expanded_snapshots(|transactions_modified, _tx_idx, recreated| {
+                let nodes_new = nodes_new_idx
+                    .values()
+                    // don't re-run transactions we've already processed
+                    .filter(|n| !exists_idx.contains(n.id()))
+                    .map(|x| x.into())
+                    .collect::<Vec<_>>();
+                let nodes_modified = transactions_modified.iter().map(|x| x.into()).collect::<Vec<_>>();
 
-            let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_old, &nodes_new]);
-            if dag.missing().len() > 0 {
-                Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
-            }
-
-            let global_state = dag.apply(
-                &mut branch_state,
-                |node| {
-                    let mut state = TopicState::new();
-                    state.apply_transaction(node.node(), our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
-                    Ok(state)
-                },
-                |node| new_transactions_only_reference_tail_nodes && exists_idx.contains(node.id()),
-                |state, node| state.validate_transaction(node.node()),
-                |state, node| state.apply_transaction(node.node(), our_master_key, our_crypto_keypairs, our_identity_id, our_device_id),
-            )?;
-            (global_state, dag.tail().clone().into_iter().cloned().collect())
+                let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_old, &nodes_new, &nodes_modified]);
+                if dag.missing().len() > 0 {
+                    Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
+                }
+                let global_state = dag.apply(
+                    &mut branch_state,
+                    |node| {
+                        let mut state = TopicState::new();
+                        state.apply_transaction(node.node(), our_master_key, our_crypto_keypairs, our_identity_id, our_device_id)?;
+                        Ok(state)
+                    },
+                    |node| (new_transactions_only_reference_tail_nodes && exists_idx.contains(node.id())) || recreated.contains(node.id()),
+                    |state, node| state.validate_transaction(node.node()),
+                    |state, node| state.apply_transaction(node.node(), our_master_key, our_crypto_keypairs, our_identity_id, our_device_id),
+                )?;
+                let tail_nodes = dag.tail().clone().into_iter().cloned().collect();
+                Ok((global_state.clone(), tail_nodes))
+            })?
         };
         for (_, trans) in nodes_new_idx.drain() {
             self.transactions.push(trans);
@@ -1121,13 +1124,21 @@ impl Topic {
     fn find_leaves<'a>(&'a self) -> Vec<&'a TransactionID> {
         let mut seen: HashSet<&TransactionID> = HashSet::new();
         for tx in self.transactions() {
-            match tx.transaction().entry().body() {
-                TransactionBody::ExtV1 { previous_transactions, .. } => {
-                    for prev in previous_transactions {
-                        seen.insert(prev);
-                    }
+            // account for snapshots when finding leaves
+            if let Some(snapshot) = tx.snapshot() {
+                let ops = snapshot.entry().ordered_transactions();
+                for op in ops.iter().take(ops.len() - 1) {
+                    seen.insert(op.transaction_id());
                 }
-                _ => {}
+            } else {
+                match tx.transaction().entry().body() {
+                    TransactionBody::ExtV1 { previous_transactions, .. } => {
+                        for prev in previous_transactions {
+                            seen.insert(prev);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         self.transactions()
@@ -1160,25 +1171,26 @@ impl Topic {
         Ok(trans)
     }
 
-    /// Return this topic as a [`Dag`], which provides information on the structure of the
-    /// DAG itself (missing nodes, unvisited/unreachable nodes) and also allows
-    /// [walking][Dag::walk].
-    pub fn as_dag<'a>(transactions: &'a [TopicTransaction]) -> Dag<'a, TransactionID, TopicTransaction> {
-        let nodes = transactions.iter().map(|x| x.into()).collect::<Vec<_>>();
-        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes]);
-        dag
-    }
-
-    /// Return all operations in this set, ordered causally. This will return an error if we have
-    /// any breaks in our causal chain (ie, missing transactions).
-    pub fn get_transactions_ordered<'a>(&'a self) -> Result<Vec<&'a TopicTransaction>> {
-        if self.transactions().len() == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut tx_index: HashMap<&'a TransactionID, &'a TopicTransaction> = HashMap::new();
+    /// Expands our snapshot(s), lifting the existing transactions out such that they can be
+    /// included in a DAG, recreating any missing transactions into the chain, and making sure the
+    /// causal order of all the transactions is preserved by modifying `previous_transactions`
+    /// where necessary. This effectively reverses the process of snapshotting so a DAG can be made
+    /// "whole" again after its transactions are snapshotted.
+    ///
+    /// The modified transactions, an id->tx index of all current/modified transactions, and a set
+    /// of re-created transaction ids is passed into the given callback which can then reconstruct
+    /// the DAG and walk/apply it as needed.
+    fn with_expanded_snapshots<'a, F, T>(&'a self, mut cb: F) -> Result<T>
+    where
+        F: FnMut(Vec<TopicTransaction>, HashMap<&'a TransactionID, &'a TopicTransaction>, HashSet<TransactionID>) -> Result<T>,
+    {
+        let mut tx_index: HashMap<&TransactionID, &TopicTransaction> = HashMap::new();
         let mut unsets: HashSet<TransactionID> = HashSet::new();
-        let mut snapshots: HashMap<&'a TransactionID, Vec<&'a TransactionID>> = HashMap::new();
+        let mut snapshots: HashMap<&TransactionID, Vec<&TransactionID>> = HashMap::new();
+
+        if self.transactions().len() == 0 {
+            return cb(Vec::new(), HashMap::new(), HashSet::new());
+        }
 
         for tx in self.transactions() {
             tx_index.insert(tx.id(), tx);
@@ -1191,12 +1203,21 @@ impl Topic {
             }
         }
 
-        let mut transactions_clone = self.transactions().clone();
+        // this collection will house transactions from two sources:
+        //
+        // 1. transactions that contain snapshots. the snapshots are removed and expended, and the
+        //    raw transaction is then added to this vec. note that although the original
+        //    transaction will will exist, this vec will be fed to the DAG builder after the
+        //    originals (self.transactions()) which effectively overrides the previous entries.
+        // 2. removed transactions that are then recreated by our heroic snapshot(s).
+        let mut transactions_modified = Vec::new();
         // a store for saving mods to operations that we can't do inline because of borrow checker
         // stuff
         let mut tx_set_prev: HashMap<TransactionID, Vec<TransactionID>> = HashMap::new();
-        // any ops that we need to recreate. see comment below for deets.
+        // any tx that we need to recreate. see comment below for deets.
         let mut recreate_unset_tx: Vec<(TransactionID, Timestamp)> = Vec::new();
+        // any tx that have been recreated. this is passed into our callback.
+        let mut recreated: HashSet<TransactionID> = HashSet::new();
         // things are going to get weird here. because we can delete items in our DAG via
         // snapshotting, that means our DAG can have broken chains that might leave a whole lot of
         // nodes "unvisited."
@@ -1237,24 +1258,52 @@ impl Topic {
         //
         // Note that in this case, D is no longer a snapshot but a regular tx...just like any of
         // them.
-        for tx in transactions_clone.iter_mut() {
-            if let Some(mut snapshot) = tx.snapshot_mut().take() {
-                let mut last_snap_transaction_id = None;
-                for snap_op in snapshot.entry_mut().ordered_transactions_mut().drain(..) {
-                    match &snap_op {
-                        SnapshotOrderedOp::Remove { id, timestamp } => {
-                            if !tx_index.contains_key(id) {
-                                recreate_unset_tx.push((id.clone(), timestamp.clone()));
-                            }
-                        }
-                        _ => {}
-                    }
-                    tx_set_prev.insert(snap_op.transaction_id().clone(), last_snap_transaction_id.unwrap_or_else(|| Vec::new()));
-                    last_snap_transaction_id = Some(vec![snap_op.transaction_id().clone()]);
-                }
+        for tx in self.transactions() {
+            // skip any transaction that doesn't contain a snapshot
+            if !tx.snapshot().is_some() {
+                continue;
             }
+            // clone the transaction since we're going to modify it and push it into our mods list
+            let tx_cloned = tx.clone();
+            let mut snapshot = tx_cloned.snapshot().as_ref().expect("snapshot should definitely exist").clone();
+            let mut last_snap_transaction_id = None;
+            for snap_op in snapshot.entry_mut().ordered_transactions_mut().drain(..) {
+                // if this is a removal, we need to mark it for re-creation, otherwise we assume
+                // that the tx already exists in the original transactions list and can be
+                // referenced directly (since snapshots don't actually store transactions, just
+                // ordered transaction ids).
+                let prev_new = last_snap_transaction_id.unwrap_or_else(|| Vec::new());
+                let modify_prev = match &snap_op {
+                    SnapshotOrderedOp::Remove { id, timestamp } => {
+                        if !tx_index.contains_key(id) {
+                            recreate_unset_tx.push((id.clone(), timestamp.clone()));
+                        }
+                        // when re-creating, we always request setting previous_transactions
+                        true
+                    }
+                    _ => {
+                        let snap_tx = tx_index
+                            .get(snap_op.transaction_id())
+                            .ok_or_else(|| Error::TopicMissingTransactions(vec![snap_op.transaction_id().clone()]))?;
+                        let prev_current = snap_tx.previous_transactions()?;
+                        let prev_eq = (prev_current.len() == 0 && prev_new.len() == 0)
+                            || (prev_current.len() == 1 && prev_new.len() == 1 && prev_current[0] == &prev_new[0]);
+                        !prev_eq
+                    }
+                };
+
+                // if our new previsout_transactions value is actually different from the original
+                // transaction, set it to be modified later. otherwise, don't bother.
+                if modify_prev {
+                    tx_set_prev.insert(snap_op.transaction_id().clone(), prev_new);
+                }
+
+                last_snap_transaction_id = Some(vec![snap_op.transaction_id().clone()]);
+            }
+            transactions_modified.push(tx_cloned);
         }
 
+        // now, recreate any transactions that were unset/removed to fill in the blanks in our DAG
         for (id, timestamp) in recreate_unset_tx {
             let trans = Transaction::create_raw_with_id(
                 id,
@@ -1263,6 +1312,7 @@ impl Topic {
                 TransactionBody::ExtV1 {
                     creator: TransactionID::from(Hash::new_blake3_from_bytes([0u8; 32])).into(),
                     ty: None,
+                    // we set this a bit later
                     previous_transactions: vec![],
                     context: None,
                     payload: Vec::new().into(),
@@ -1273,33 +1323,54 @@ impl Topic {
                 transaction: trans,
                 snapshot: None,
             };
-            transactions_clone.push(recreated_op);
+            recreated.insert(recreated_op.id().clone());
+            transactions_modified.push(recreated_op);
         }
 
-        for tx in transactions_clone.iter_mut() {
+        // now, modify any previous_transactions fields as dictated by our expanded snapshot
+        for tx in transactions_modified.iter_mut() {
             if let Some(prev) = tx_set_prev.remove(tx.id()) {
                 let _ = tx.transaction_mut().try_mod_ext_previous_transaction(prev)?;
             }
         }
-
-        let nodes = transactions_clone.iter().map(|x| x.into()).collect::<Vec<_>>();
-        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes]);
-        if dag.missing().len() > 0 {
-            Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
-        }
-        let mut output: Vec<&'a TopicTransaction> = Vec::with_capacity(self.transactions().len() - unsets.len());
-        for node_id in dag.visited() {
-            #[allow(suspicious_double_ref_op)]
-            let node = dag
-                .index()
-                .get(node_id)
-                .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
-            // NOTE: we can't push `node.node()` directly here because it's a clone of our
-            // original list, so instead we pull from our dumb tx index.
-            if let Some(tx) = tx_index.remove(node.node().id()) {
-                output.push(tx);
+        for tx in self.transactions() {
+            if let Some(prev) = tx_set_prev.remove(tx.id()) {
+                let mut tx_clone = tx.clone();
+                let _ = tx_clone.transaction_mut().try_mod_ext_previous_transaction(prev)?;
+                transactions_modified.push(tx_clone);
             }
         }
+
+        cb(transactions_modified, tx_index, recreated)
+    }
+
+    /// Return all operations in this set, ordered causally. This will return an error if we have
+    /// any breaks in our causal chain (ie, missing transactions).
+    pub fn get_transactions_ordered<'a>(&'a self) -> Result<Vec<&'a TopicTransaction>> {
+        let mut output: Vec<&'a TopicTransaction> = Vec::with_capacity(self.transactions().len());
+        self.with_expanded_snapshots(|transactions_modified, mut tx_index, _recreated| {
+            let nodes_existing = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
+            let nodes_modified = transactions_modified.iter().map(|x| x.into()).collect::<Vec<_>>();
+
+            // NOTE: we explicitely pass `nodes_modified` second here!
+            let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_existing, &nodes_modified]);
+            if dag.missing().len() > 0 {
+                Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
+            }
+            for node_id in dag.visited() {
+                #[allow(suspicious_double_ref_op)]
+                let node = dag
+                    .index()
+                    .get(node_id)
+                    .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
+                // NOTE: we can't push `node.node()` directly here because it's a clone of our
+                // original list, so instead we pull from our dumb tx index.
+                if let Some(tx) = tx_index.remove(node.node().id()) {
+                    output.push(tx);
+                }
+            }
+            Ok(())
+        })?;
         Ok(output)
     }
 
@@ -1350,124 +1421,124 @@ impl Topic {
     ///
     /// This returns a list of all operations that have been removed by the snapshot process,
     /// allowing deletion in whatever storage mechanism.
-    pub fn snapshot(&mut self, master_key: &SecretKey, sign_key: &SignKeypair, replaces: &TransactionID) -> Result<Vec<TransactionID>> {
-        let mut tx_index: HashMap<&TransactionID, &TopicTransaction> = HashMap::new();
-        let mut unsets_in_causal_chain: HashSet<TransactionID> = HashSet::new();
-        let mut in_existing_snapshot: HashSet<&TransactionID> = HashSet::new();
-        let mut include_in_current_snapshot: HashSet<&TransactionID> = HashSet::new();
-        let mut removed = Vec::new();
+    pub fn snapshot(&mut self, master_key: &SecretKey, sign_key: &SignKeypair, replaces: &TransactionID) -> Result<HashSet<TransactionID>> {
+        let (final_nodes, removed) = self.with_expanded_snapshots(|transactions_modified, _tx_index, _recreated| {
+            // this tracks nodes that either a) unset other nodes or b) have been unset
+            let mut unsets_in_causal_chain: HashSet<TransactionID> = HashSet::new();
+            // tracks transactions that are part of another snapshot
+            let mut in_existing_snapshot: HashMap<&TransactionID, &SnapshotOrderedOp> = HashMap::new();
+            // a set of all transactions that this snapshot will encompass
+            let mut include_in_current_snapshot: HashSet<&TransactionID> = HashSet::new();
+            // track transactions that have been removed as part of other previous snapshots. we
+            // need to do this so we don't go trying to load data from these removals (which will
+            // be expanded to fake transactions by `with_expanded_snapshots()`)
+            let mut previously_snapshotted_removals: HashMap<&TransactionID, &SnapshotOrderedOp> = HashMap::new();
+            // a list of transactions that are being removed by this snapshot. this is returned to the
+            // caller so these transactions can be wiped from storage.
+            let mut removed = HashSet::new();
 
-        // index our ops
-        for tx in self.transactions() {
-            tx_index.insert(tx.id(), tx);
-        }
-
-        // find and index all nodes causally preceding (and including) `replaces`.
-        // this gives is a big fat list we can compare against when creating the final snapshot
-        // list.
-        let mut walk_queue = VecDeque::new();
-        walk_queue.push_back(replaces);
-        while let Some(id) = walk_queue.pop_front() {
-            include_in_current_snapshot.insert(id);
-            let tx = match tx_index.get(id) {
-                Some(x) => x,
-                None => continue,
-            };
-            for prev in tx.previous_transactions()? {
-                walk_queue.push_back(prev);
+            let nodes_old = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
+            let nodes_modified = transactions_modified.iter().map(|x| x.into()).collect::<Vec<_>>();
+            let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes_old, &nodes_modified]);
+            if dag.missing().len() > 0 {
+                Err(Error::TopicMissingTransactions(dag.missing().iter().cloned().cloned().collect::<Vec<_>>()))?;
             }
-        }
+            if !dag.visited().contains(&replaces) {
+                Err(Error::SnapshotFailed)?;
+            }
 
-        // sorry for all the loops
-        for tx in self.transactions() {
-            if let Some(snapshot) = tx.snapshot.as_ref() {
-                for transaction_id in snapshot.all_transactions() {
-                    in_existing_snapshot.insert(transaction_id);
+            // find and index all nodes causally preceding (and including) `replaces`.
+            // this gives is a big fat list we can compare against when creating the final snapshot
+            // list.
+            let mut walk_queue = VecDeque::new();
+            walk_queue.push_back(replaces);
+            while let Some(id) = walk_queue.pop_front() {
+                include_in_current_snapshot.insert(id);
+                let tx = match dag.index().get(id) {
+                    Some(x) => x.node(),
+                    None => continue,
+                };
+                for prev in tx.previous_transactions()? {
+                    walk_queue.push_back(prev);
                 }
             }
-            // only track unsets *if the unsetting node is in the snapshot's causal chain*
-            if include_in_current_snapshot.contains(tx.id()) {
-                for txid in tx.unset_ids()? {
-                    unsets_in_causal_chain.insert(txid);
-                }
-            }
-        }
 
-        let nodes = self.transactions().iter().map(|x| x.into()).collect::<Vec<_>>();
-        let dag: Dag<TransactionID, TopicTransaction> = Dag::from_nodes(&[&nodes]);
-
-        // this list will replace `self.operations`
-        let mut final_nodes: Vec<TopicTransaction> = Vec::with_capacity(self.transactions().len());
-        // this is our final snapshot list
-        let mut snapshot_ordered_operations: Vec<SnapshotOrderedOp> = Vec::new();
-        let mut found_replacement_node = false;
-        for node_id in dag.visited() {
-            #[allow(suspicious_double_ref_op)]
-            let node = dag
-                .index()
-                .get(node_id)
-                .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
-            #[allow(suspicious_double_ref_op)]
-            let mut tx: TopicTransaction = node.node().clone().clone();
-            if !found_replacement_node {
+            // sorry for all the loops
+            //
+            // we're going to index all transactions that exist in previous snapshots, as well as find
+            // all nodes in this snapshot's causal chain that have been unset
+            for tx in self.transactions() {
+                // only track unsets *if the unsetting node is in the snapshot's causal chain*
                 if include_in_current_snapshot.contains(tx.id()) {
-                    // null out any previous snapshots in this causal chain.. at this point, their ordered
-                    // operation list has been folded into our final list.
-                    //
-                    // one snapshot to rule them all.
-                    if let Some(mut snapshot) = tx.snapshot_mut().take() {
-                        // if this tx IS a snapshot, push its items, in order, onto the
-                        // snapshot_ordered_operations list.
-                        for save_op in snapshot.entry_mut().ordered_transactions_mut().drain(..) {
-                            if save_op.is_keep() {
-                                if let Some(tx) = tx_index.get(save_op.transaction_id()) {
-                                    #[allow(suspicious_double_ref_op)]
-                                    final_nodes.push(tx.clone().clone());
-                                }
+                    for txid in tx.unset_ids()? {
+                        unsets_in_causal_chain.insert(txid);
+                    }
+                }
+                // track and save a) all previously snapshotted tx and b) all removals
+                if let Some(snapshot) = tx.snapshot() {
+                    for op in snapshot.entry().ordered_transactions() {
+                        in_existing_snapshot.insert(op.transaction_id(), op);
+                        match op {
+                            SnapshotOrderedOp::Remove { id, .. } => {
+                                previously_snapshotted_removals.insert(id, op);
                             }
-                            snapshot_ordered_operations.push(save_op);
-                        }
-                    } else if tx.id() != replaces && !in_existing_snapshot.contains(tx.id()) {
-                        if tx.is_unset()? || unsets_in_causal_chain.contains(tx.id()) {
-                            // if we still haven't found our replacement node and the current tx is
-                            // eligible, push it onto the ordered tx list
-                            let save = SnapshotOrderedOp::Remove {
-                                id: tx.id().clone(),
-                                timestamp: tx.timestamp().clone(),
-                            };
-                            snapshot_ordered_operations.push(save);
-                            // notify the caller this tx can be removed.
-                            removed.push(tx.id().clone());
-                        } else {
-                            // if we still haven't found our replacement node and the current tx is
-                            // eligible, push it onto the ordered tx list
-                            let save = SnapshotOrderedOp::Keep { id: tx.id().clone() };
-                            snapshot_ordered_operations.push(save);
-                            final_nodes.push(tx.clone());
+                            _ => {}
                         }
                     }
-                } else {
-                    final_nodes.push(tx.clone());
                 }
-            } else {
-                final_nodes.push(tx.clone());
             }
 
-            if tx.id() == replaces {
-                // this is our replacement node! create our snapshot.
-                // NOTE: we specifically do NOT push the replacement node id onto the ordered_ops
-                // list above because it's not a given it will run and its easier to do the
-                // final push here instead.
-                let save = SnapshotOrderedOp::Keep { id: tx.id().clone() };
-                snapshot_ordered_operations.push(save);
-                tx.snapshot = Some(Snapshot::new(master_key, sign_key, snapshot_ordered_operations.clone())?);
-                found_replacement_node = true;
-                final_nodes.push(tx.clone());
+            // this list will replace `self.transactions`
+            let mut final_nodes: Vec<TopicTransaction> = Vec::with_capacity(self.transactions().len());
+            // this is our final snapshot list
+            let mut snapshot_ordered_operations: Vec<SnapshotOrderedOp> = Vec::new();
+            // marks whether or not we actually found our replacement node
+            for node_id in dag.visited() {
+                #[allow(suspicious_double_ref_op)]
+                let node = dag
+                    .index()
+                    .get(node_id)
+                    .ok_or_else(|| Error::TopicMissingTransactions(vec![node_id.clone().clone()]))?;
+                #[allow(suspicious_double_ref_op)]
+                let mut tx: TopicTransaction = node.node().clone().clone();
+                // just remove any existing snapshots. we don't need them anymore.
+                tx.snapshot_mut().take();
+                if tx.id() == replaces {
+                    // this is our replacement node! create our snapshot.
+                    let save = SnapshotOrderedOp::Keep { id: tx.id().clone() };
+                    snapshot_ordered_operations.push(save);
+                    tx.snapshot = Some(Snapshot::new(master_key, sign_key, snapshot_ordered_operations.clone())?);
+                    final_nodes.push(tx);
+                } else if include_in_current_snapshot.contains(tx.id()) {
+                    if let Some(op) = in_existing_snapshot.remove(tx.id()) {
+                        match op {
+                            SnapshotOrderedOp::Keep { .. } => {
+                                final_nodes.push(tx);
+                            }
+                            _ => {}
+                        }
+                        snapshot_ordered_operations.push(op.clone());
+                    } else if tx.is_unset()? || unsets_in_causal_chain.contains(tx.id()) {
+                        // if we still haven't found our replacement node and the current tx is
+                        // eligible, push it onto the ordered tx list
+                        let save = SnapshotOrderedOp::Remove {
+                            id: tx.id().clone(),
+                            timestamp: tx.timestamp().clone(),
+                        };
+                        snapshot_ordered_operations.push(save);
+                        // notify the caller this tx can be removed.
+                        removed.insert(tx.id().clone());
+                    } else {
+                        let save = SnapshotOrderedOp::Keep { id: tx.id().clone() };
+                        snapshot_ordered_operations.push(save);
+                        final_nodes.push(tx);
+                    }
+                } else {
+                    final_nodes.push(tx);
+                }
             }
-        }
-        if !found_replacement_node {
-            Err(Error::SnapshotFailed)?;
-        }
+            Ok((final_nodes, removed))
+        })?;
         self.transactions = final_nodes;
         Ok(removed)
     }
@@ -1547,6 +1618,11 @@ pub(crate) mod tests {
     }
 
     #[allow(dead_code)]
+    fn ids_to_names(map: &HashMap<TransactionID, &'static str>, ops: &[&TransactionID]) -> Vec<&'static str> {
+        ops.iter().map(|x| map.get(x).cloned().unwrap_or("??")).collect::<Vec<_>>()
+    }
+
+    #[allow(dead_code)]
     fn dump_tx_(id_to_name: &HashMap<TransactionID, &'static str>, transactions: &[Transaction]) {
         for tx in transactions {
             println!("- idx: {} -> {}", id_to_name.get(tx.id()).unwrap(), tx.id());
@@ -1562,11 +1638,6 @@ pub(crate) mod tests {
     }
 
     #[allow(dead_code)]
-    fn ids_to_names(map: &HashMap<TransactionID, &'static str>, ops: &[&TransactionID]) -> Vec<&'static str> {
-        ops.iter().map(|x| map.get(x).cloned().unwrap_or("??")).collect::<Vec<_>>()
-    }
-
-    #[allow(dead_code)]
     fn dump_tx(tx: &[(&'static str, &Transaction)]) {
         let name_map = tx.iter().map(|(name, tx)| (tx.id().clone(), name)).collect::<HashMap<_, _>>();
         for (name, trans) in tx {
@@ -1577,12 +1648,12 @@ pub(crate) mod tests {
                 .expect("previous_transactions()")
                 .iter()
                 .map(|prev| {
-                    let name = name_map.get(prev).unwrap_or(&&"<null>");
+                    let name = name_map.get(prev).unwrap_or(&&"<missing>");
                     format!("{}", name)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            println!("- {} -- {}    prev: [{}]", trans.id(), name, next);
+            println!("- {}:    {}    prev: [{}]", trans.id(), name, next);
         }
     }
 
@@ -1607,6 +1678,7 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    // TODO: rm and replace all instances with `Peer`
     struct PacketGen<'a, 'b, 'c> {
         rng: ChaCha20Rng,
         transactions: &'a Transactions,
@@ -1800,7 +1872,35 @@ pub(crate) mod tests {
             self.topic.replace(topic);
             Ok(dag_state)
         }
+
+        fn snapshot(&self, replaces: &TransactionID) -> Result<HashSet<TransactionID>> {
+            let identity = self.identity().build_identity().unwrap();
+            let sign_key = identity
+                .keychain()
+                .subkey_by_name("/stamp/sync/v1/sign")
+                .unwrap()
+                .key()
+                .as_signkey()
+                .unwrap();
+            let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
+            let mut topic = self.topic.replace(fake_topic);
+            let res = topic.snapshot(self.master_key(), &sign_key, replaces)?;
+            self.topic.replace(topic);
+            Ok(res)
+        }
     }
+
+    /// A quick structure we can use for creating data within a topic.
+    #[derive(Clone, Debug, PartialEq, AsnType, Encode, Decode)]
+    struct AppData {
+        data: String,
+    }
+    impl AppData {
+        fn new<T: Into<String>>(data: T) -> Self {
+            Self { data: data.into() }
+        }
+    }
+    impl SerdeBinary for AppData {}
 
     fn create_1p_topic(
         topic_id: &TopicID,
@@ -1820,6 +1920,48 @@ pub(crate) mod tests {
         let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
         Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[&crypto_key], &identity_id, device_id)
             .unwrap()
+    }
+
+    // creates a device_id -> crypto pubkey mapping
+    fn device_lookup<'a>(packets: &[&'a KeyPacket]) -> BTreeMap<&'a DeviceID, &'a CryptoKeypairPublic> {
+        packets
+            .iter()
+            .map(|p| (p.entry().device_id(), p.entry().pubkey()))
+            .collect::<BTreeMap<_, _>>()
+    }
+
+    // creates a lookup table for a set of peers
+    fn id_lookup<'a>(peers: &[&'a Peer]) -> HashMap<IdentityID, &'a Transactions> {
+        peers
+            .iter()
+            .map(|p| (p.identity().identity_id().unwrap(), p.identity()))
+            .collect::<HashMap<_, _>>()
+    }
+
+    fn admin_perms() -> Vec<Permission> {
+        vec![
+            Permission::DataSet,
+            Permission::DataUnset,
+            Permission::MemberDevicesUpdate,
+            Permission::MemberPermissionsChange,
+            Permission::TopicRekey,
+        ]
+    }
+
+    // reduces some boilerplate when creating re-key entries
+    macro_rules! rkmember {
+        ($peer:expr, $permissions:expr, $keyidx:expr) => {
+            (
+                $peer.as_member($permissions, vec![$peer.device().clone()]),
+                &device_lookup(&[&$peer.key_packets()[$keyidx]]),
+            )
+        };
+    }
+
+    macro_rules! topicdata {
+        ($peer:expr) => {{
+            $peer.topic().get_data::<AppData>().unwrap().into_iter().collect::<Result<Vec<_>>>()
+        }};
     }
 
     #[test]
@@ -2026,33 +2168,6 @@ pub(crate) mod tests {
 
     #[test]
     fn topic_multi_user_e2e_workflow() {
-        // creates a lookup table for a set of peers
-        fn id_lookup<'a>(peers: &[&'a Peer]) -> HashMap<IdentityID, &'a Transactions> {
-            peers
-                .iter()
-                .map(|p| (p.identity().identity_id().unwrap(), p.identity()))
-                .collect::<HashMap<_, _>>()
-        }
-
-        // creates a device_id -> crypto pubkey mapping
-        fn device_lookup<'a>(packets: &[&'a KeyPacket]) -> BTreeMap<&'a DeviceID, &'a CryptoKeypairPublic> {
-            packets
-                .iter()
-                .map(|p| (p.entry().device_id(), p.entry().pubkey()))
-                .collect::<BTreeMap<_, _>>()
-        }
-
-        macro_rules! topicdata {
-            ($peer:expr) => {{
-                $peer
-                    .topic()
-                    .get_data::<AppData>()
-                    .unwrap()
-                    .into_iter()
-                    .collect::<Result<Vec<_>>>()
-            }};
-        }
-
         // grab the transaction ids currently within a peer's topic
         macro_rules! txids {
             ($peer:expr) => {{
@@ -2065,36 +2180,6 @@ pub(crate) mod tests {
                     .collect::<Vec<&TransactionID>>()
             }};
         }
-
-        // reduces some boilerplate when creating re-key entries
-        macro_rules! rkmember {
-            ($peer:expr, $permissions:expr, $keyidx:expr) => {
-                (
-                    $peer.as_member($permissions, vec![$peer.device().clone()]),
-                    &device_lookup(&[&$peer.key_packets()[$keyidx]]),
-                )
-            };
-        }
-
-        #[derive(Clone, Debug, PartialEq, AsnType, Encode, Decode)]
-        struct AppData {
-            data: String,
-        }
-        impl AppData {
-            fn new<T: Into<String>>(data: T) -> Self {
-                Self { data: data.into() }
-            }
-        }
-        impl SerdeBinary for AppData {}
-
-        // we use these a lot so make it official
-        let admin_perms = vec![
-            Permission::DataSet,
-            Permission::DataUnset,
-            Permission::MemberDevicesUpdate,
-            Permission::MemberPermissionsChange,
-            Permission::TopicRekey,
-        ];
 
         // because we can't infer types for some reason
         let empty_tx = Vec::<&TransactionID>::new();
@@ -2112,7 +2197,7 @@ pub(crate) mod tests {
         let genesis = {
             let packet = butch_laptop
                 .topic()
-                .rekey(&mut rng, vec![rkmember!(&butch_laptop, admin_perms.clone(), 0)])
+                .rekey(&mut rng, vec![rkmember!(&butch_laptop, admin_perms(), 0)])
                 .unwrap();
             butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
@@ -2163,8 +2248,8 @@ pub(crate) mod tests {
                 .rekey(
                     &mut rng,
                     vec![
-                        rkmember!(&butch_laptop, admin_perms.clone(), 0),
-                        rkmember!(&dotty_laptop, admin_perms.clone(), 0),
+                        rkmember!(&butch_laptop, admin_perms(), 0),
+                        rkmember!(&dotty_laptop, admin_perms(), 0),
                     ],
                 )
                 .unwrap();
@@ -2318,10 +2403,10 @@ pub(crate) mod tests {
                     &mut rng,
                     vec![
                         (
-                            butch_laptop.as_member(admin_perms.clone(), vec![butch_laptop.device().clone(), butch_phone.device().clone()]),
+                            butch_laptop.as_member(admin_perms(), vec![butch_laptop.device().clone(), butch_phone.device().clone()]),
                             &device_lookup(&[&butch_laptop.key_packets()[0], &butch_phone.key_packets()[0]]),
                         ),
-                        rkmember!(&dotty_laptop, admin_perms.clone(), 0),
+                        rkmember!(&dotty_laptop, admin_perms(), 0),
                         rkmember!(&jerry_laptop, vec![Permission::DataSet, Permission::DataUnset], 0),
                         rkmember!(&frankie_phone, vec![Permission::DataSet, Permission::DataUnset], 0),
                     ],
@@ -2459,18 +2544,18 @@ pub(crate) mod tests {
         let data4 = jerry_laptop.tx_data(ts("2024-12-10T00:00:00Z"), AppData::new("jerry reporting in"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap();
-            butch_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap();
-            jerry_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap();
-            frankie_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap();
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
         }
         let data5 = jerry_laptop.tx_data(ts("2024-12-10T00:01:00Z"), AppData::new("just saw a cat"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            butch_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap();
-            butch_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap();
-            jerry_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap();
-            frankie_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap();
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
         }
         let data6 = frankie_phone.tx_data(ts("2024-12-10T00:02:00Z"), AppData::new("i hate cats"), None, None);
         {
@@ -2543,6 +2628,135 @@ pub(crate) mod tests {
             assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
             assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
         }
+    }
+
+    #[test]
+    fn topic_dag_rebuild_with_snapshot() {
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe").unwrap().as_bytes().try_into().unwrap());
+        let mut dotty = Peer::new_identity(&mut rng, "dupedupe123", "dogphone");
+        let mut butch = Peer::new_identity(&mut rng, "butch6969", "laptop");
+        let genesis = {
+            let packet = dotty.topic().rekey(&mut rng, vec![rkmember!(&dotty, admin_perms(), 0)]).unwrap();
+            dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+        };
+        dotty.push_tx(&id_lookup(&[&dotty]), &[&genesis]).unwrap();
+
+        let rekey1 = {
+            let packet = dotty
+                .topic()
+                .rekey(&mut rng, vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)])
+                .unwrap();
+            dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet)
+        };
+
+        dotty.push_tx(&id_lookup(&[&dotty, &butch]), &[&rekey1]).unwrap();
+        butch.push_tx(&id_lookup(&[&dotty, &butch]), &[&rekey1, &genesis]).unwrap();
+
+        let data1 = butch.tx_data(ts("2024-12-10T01:00:00Z"), AppData::new("hi i'm butch"), None, None);
+        butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
+        dotty.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
+        let data2 = dotty.tx_data(ts("2024-12-10T02:00:00Z"), AppData::new("haiii!"), None, None);
+        dotty.push_tx(&id_lookup(&[&dotty]), &[&data2]).unwrap();
+        butch.push_tx(&id_lookup(&[&dotty]), &[&data2]).unwrap();
+
+        let rm1 = dotty.tx(
+            ts("2024-12-10T02:30:00Z"),
+            None,
+            Packet::DataUnset {
+                transaction_ids: vec![data2.id().clone()],
+            },
+        );
+        dotty.push_tx(&id_lookup(&[&dotty]), &[&rm1]).unwrap();
+        butch.push_tx(&id_lookup(&[&dotty]), &[&rm1]).unwrap();
+
+        let data3 = dotty.tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("nice knowing you"), None, None);
+        let data4 = butch.tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("oh, what's this????"), None, None);
+        butch.push_tx(&id_lookup(&[&butch, &dotty]), &[&data3, &data4]).unwrap();
+        dotty.push_tx(&id_lookup(&[&butch, &dotty]), &[&data3, &data4]).unwrap();
+
+        let data5 = butch.tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("i'm not to be disturbed."), None, None);
+        butch.push_tx(&id_lookup(&[&butch, &dotty]), &[&data5]).unwrap();
+        dotty.push_tx(&id_lookup(&[&butch, &dotty]), &[&data5]).unwrap();
+
+        // make sure we got a merge. not technically required for this test but i want to cover the
+        // bases anyway
+        assert_eq!(TopicTransaction::new(data5.clone()).previous_transactions().unwrap().len(), 2);
+        assert_eq!(dotty.topic().transactions().len(), 8);
+        assert_eq!(dotty.topic().find_leaves(), vec![data5.id()]);
+
+        // ok now we create a dumb snapshot
+        dotty.snapshot(data3.id()).unwrap();
+
+        assert_eq!(
+            topicdata!(dotty).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("oh, what's this????"),
+                AppData::new("nice knowing you"),
+                AppData::new("i'm not to be disturbed."),
+            ]
+        );
+
+        // make sure our leaves are still legit
+        assert_eq!(dotty.topic().find_leaves(), vec![data5.id()]);
+
+        // snapshot should kick out our remover and removee transactions
+        assert_eq!(dotty.topic().transactions().len(), 6);
+
+        let data6 = dotty.tx_data(ts("2024-12-11T00:00:00Z"), AppData::new("wise and shine"), None, None);
+
+        // data6's prev should ONLY be data5
+        assert_eq!(TopicTransaction::new(data6.clone()).previous_transactions().unwrap(), vec![data5.id()]);
+
+        dotty.push_tx(&id_lookup(&[&dotty]), &[&data6]).unwrap();
+
+        assert_eq!(
+            topicdata!(dotty).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("oh, what's this????"),
+                AppData::new("nice knowing you"),
+                AppData::new("i'm not to be disturbed."),
+                AppData::new("wise and shine"),
+            ]
+        );
+
+        // wow the DAG is getting very bloated again, let's snapshot
+        dotty.snapshot(data6.id()).unwrap();
+        assert_eq!(dotty.topic().transactions().len(), 7);
+
+        assert_eq!(
+            dotty
+                .topic()
+                .transactions()
+                .iter()
+                .find(|t| t.id() == data6.id())
+                .unwrap()
+                .snapshot()
+                .as_ref()
+                .unwrap()
+                .all_transactions(),
+            vec![&genesis, &rekey1, &data1, &data2, &rm1, &data4, &data3, &data5, &data6,]
+                .into_iter()
+                .map(|t| t.id())
+                .collect::<Vec<_>>()
+        );
+
+        // and push another tx
+        let data7 = dotty.tx_data(ts("2024-12-12T00:00:00Z"), AppData::new("this way, please"), None, None);
+        dotty.push_tx(&id_lookup(&[&dotty]), &[&data7]).unwrap();
+
+        assert_eq!(
+            topicdata!(dotty).unwrap(),
+            vec![
+                AppData::new("hi i'm butch"),
+                AppData::new("oh, what's this????"),
+                AppData::new("nice knowing you"),
+                AppData::new("i'm not to be disturbed."),
+                AppData::new("wise and shine"),
+                AppData::new("this way, please"),
+            ]
+        );
     }
 
     #[test]
