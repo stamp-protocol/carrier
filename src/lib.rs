@@ -1793,7 +1793,7 @@ pub(crate) mod tests {
     use std::ops::Add;
     use std::str::FromStr;
     use std::sync::{mpsc, Arc, Mutex};
-    use tracing::log::info;
+    use tracing::log::{info, warn};
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
     #[allow(dead_code)]
@@ -3769,7 +3769,17 @@ pub(crate) mod tests {
         }
 
         // TODO: rayon thread pool
-        for i in 0..1000 {
+        let start: usize = std::env::var("CARRIER_PROC_TEST_START")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(0);
+        let end: usize = std::env::var("CARRIER_PROC_TEST_END")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(5);
+        if std::env::var("CARRIER_PROC_TEST_LOG") == Ok(String::from("1")) {
+            setup();
+        }
+        for i in start..end {
+            warn!("run {}", i);
             run_topic(format!("i like your hat {}", i).as_bytes());
         }
     }
