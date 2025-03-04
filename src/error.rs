@@ -43,6 +43,10 @@ pub enum Error {
     #[error("permission check failed (transaction {0} / permission {1:?})")]
     PermissionCheckFailed(TransactionID, Permission),
 
+    /// An attempt is being made to snapshot a subset of an existing snapshot.
+    #[error("snapshot failed: attempting to create snapshot subset of existing snapshot on tx {0}")]
+    SnapshotCollision(TransactionID),
+
     /// A snapshot failed to generate
     #[error("snapshot failed (did you pass a valid replacement id?)")]
     SnapshotFailed,
@@ -70,6 +74,20 @@ pub enum Error {
     /// A topic secret wasn't found under a certain transaction ID we expected to exist
     #[error("topic secret required but not found for transaction {0}")]
     TopicSecretNotFound(TransactionID),
+
+    /// A topic with no actual packet data is being read. No-data transactions are created by
+    /// snapshot expansion to fill in blanks in the DAG, but they cannot be read or used in any
+    /// meaningful way. You can test this via `TopicTransaction.is_empty()`
+    #[error("cannot read an empty transaction: {0}")]
+    TransactionIsEmpty(TransactionID),
+
+    /// Someone is attempting to unset a control packet
+    #[error("cannot unset a control packet: {0}")]
+    TransactionUnsetNonDataPacket(TransactionID),
+
+    /// Trying to unset a transaction that's not within the causal chain of the removal.
+    #[error("transaction {0} trying to unset transaction which is not in its causal chain ({1})")]
+    TransactionUnsetNotCausal(TransactionID, TransactionID),
 }
 
 /// Wraps `std::result::Result` around our `Error` enum
