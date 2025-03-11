@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ahash = "0.8.11"
 chrono = "0.4"
 getset = "0.1"
 rasn = "0.20"
