@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+ahash = "0.8.11"
 chrono = "0.4"
 getset = "0.1"
 rasn = "0.20"
@@ -12,5 +13,10 @@ thiserror = "1.0"
 tracing = { version = "0.1", features = ["log"] }
 
 [dev-dependencies]
+criterion = "0.4.0"
+rayon = "1.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[[bench]]
+name = "hash"
+harness = false

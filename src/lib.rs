@@ -5,6 +5,7 @@ pub mod error;
 use crate::error::{Error, Result};
 use rasn::{AsnType, Decode, Encode};
 use stamp_core::{
+    ahash::{AHashMap, AHashSet},
     crypto::base::{
         rng::{CryptoRng, RngCore},
         CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature,
@@ -13,7 +14,7 @@ use stamp_core::{
     identity::IdentityID,
     util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
 /// Defines a permission a member can have within a group.
@@ -934,7 +935,7 @@ impl SerdeBinary for TopicState {}
 /// You can probably generally ignore this unless you're hitting performance issues, in which case
 /// you'll want to investigate why your DAG is branching so much.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TopicDagState {
+pub enum TopicDagModificationResult {
     /// The DAG was rebuilt from scratch. This happens when new transactions reference (or branch
     /// off of) non-tail nodes, ie nodes that are in the middle of the chain somewhere as opposed
     /// to the end of the chain.
@@ -960,14 +961,14 @@ pub struct Topic {
     /// This topic's keychain. This starts off empty and is populated as control packets come in
     /// that give access to various identities via their sync keys. A new entry is created whenever
     /// a member is added to or removed from the topic.
-    keychain: HashMap<TransactionID, SecretKey>,
+    keychain: AHashMap<TransactionID, SecretKey>,
     /// The actual transactions (control or data) in this topic.
     transactions: Vec<TopicTransaction>,
     /// Tracks the state for the various branches in the topic DAG we can have, allowing
     /// transactions to have branch-local validation as opposed to requiring consistent state. This
     /// mapping exists largely as a cache so we don't have to re-run all the transactions from
     /// start to finish each time we need to add a new transaction to the topic.
-    branch_state: HashMap<TransactionID, TopicState>,
+    branch_state: AHashMap<TransactionID, TopicState>,
     /// Tracks the tail references of the most recent state update to the topic DAG. You mostly
     /// shouldn't think about this at all since its function is purely for internal optimization.
     last_tail_nodes: Vec<TransactionID>,
@@ -979,9 +980,9 @@ impl Topic {
         Self {
             id,
             state: TopicState::new(),
-            keychain: HashMap::new(),
+            keychain: AHashMap::new(),
             transactions: Vec::new(),
-            branch_state: HashMap::new(),
+            branch_state: AHashMap::new(),
             last_tail_nodes: Vec::new(),
         }
     }
@@ -995,7 +996,7 @@ impl Topic {
     pub fn new_from_transactions(
         id: TopicID,
         transactions: Vec<TopicTransaction>,
-        identities: &HashMap<IdentityID, &Transactions>,
+        identities: &AHashMap<IdentityID, &Transactions>,
         our_master_key: &SecretKey,
         our_crypto_keypairs: &[&CryptoKeypair],
         our_identity_id: &IdentityID,
@@ -1039,11 +1040,11 @@ impl Topic {
     /// This verifies the transactions at the top-level with their issuing identities, so have
     /// those handy when calling. We also need to pass in our master key to unlock our crypto
     /// keypairs, allowing us to apply key changes in the topic sent to us.
-    #[tracing::instrument(err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], transactions = %transactions.iter().map(|t| String::from(&format!("{}", t.id())[0..8])).collect::<Vec<_>>().join(", ")))]
+    #[tracing::instrument(err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], num_transactions = %transactions.len()))]
     pub fn push_transactions(
         mut self,
         transactions: Vec<TopicTransaction>,
-        identities: &HashMap<IdentityID, &Transactions>,
+        identities: &AHashMap<IdentityID, &Transactions>,
         our_master_key: &SecretKey,
         our_crypto_keypairs: &[&CryptoKeypair],
         our_identity_id: &IdentityID,
@@ -1061,18 +1062,18 @@ impl Topic {
     /// keypairs, allowing us to apply key changes in the topic sent to us.
     ///
     /// This is exactly like [`Topic::push_transactions()`] but works without consuming the topic.
-    #[tracing::instrument(err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], transactions = %transactions.iter().map(|t| String::from(&format!("{}", t.id())[0..8])).collect::<Vec<_>>().join(", ")))]
+    #[tracing::instrument(err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], num_transactions = %transactions.len()))]
     pub fn push_transactions_mut(
         &mut self,
         transactions: Vec<TopicTransaction>,
-        identities: &HashMap<IdentityID, &Transactions>,
+        identities: &AHashMap<IdentityID, &Transactions>,
         our_master_key: &SecretKey,
         our_crypto_keypairs: &[&CryptoKeypair],
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
-    ) -> Result<TopicDagState> {
+    ) -> Result<TopicDagModificationResult> {
         // index transactions we've already processed here
-        let mut exists_idx: HashSet<&TransactionID> = HashSet::new();
+        let mut exists_idx: AHashSet<&TransactionID> = AHashSet::with_capacity(self.transactions().len());
         let nodes_old = self
             .transactions()
             .iter()
@@ -1118,7 +1119,7 @@ impl Topic {
         let new_transactions_only_reference_tail_nodes = {
             // index our DAG's tail transactions AND our new transactions into a set that we'll
             // use to check if we need to re-run the entire DAG.
-            let mut tail_or_self_idx = self.last_tail_nodes.iter().collect::<HashSet<_>>();
+            let mut tail_or_self_idx = self.last_tail_nodes.iter().collect::<AHashSet<_>>();
             for trans in &transactions_new_filtered_deduped {
                 tail_or_self_idx.insert(trans.id());
             }
@@ -1144,7 +1145,7 @@ impl Topic {
         let mut branch_state = if new_transactions_only_reference_tail_nodes {
             self.branch_state().clone()
         } else {
-            HashMap::new()
+            AHashMap::new()
         };
 
         let (global_state, last_tail_nodes) = {
@@ -1222,9 +1223,9 @@ impl Topic {
             self.generate_keychain()?;
         }
         let dag_state = if new_transactions_only_reference_tail_nodes {
-            TopicDagState::DagUpdated
+            TopicDagModificationResult::DagUpdated
         } else {
-            TopicDagState::DagRebuilt
+            TopicDagModificationResult::DagRebuilt
         };
         Ok(dag_state)
     }
@@ -1240,7 +1241,7 @@ impl Topic {
                     .map(|txid| (txid.clone(), s.secret().derive_secret_key()))
             })
             .map(|(txid, res)| Ok((txid, res?)))
-            .collect::<Result<HashMap<_, _>>>()?;
+            .collect::<Result<AHashMap<_, _>>>()?;
         self.set_keychain(keychain);
         Ok(())
     }
@@ -1300,7 +1301,7 @@ impl Topic {
     /// the DAG and walk/apply it as needed.
     fn with_expanded_snapshots<'a, F, T>(transactions: &[&'a [TopicTransaction]], mut cb: F) -> Result<T>
     where
-        F: FnMut(Vec<TopicTransaction>, HashMap<&'a TransactionID, &'a TopicTransaction>, HashSet<TransactionID>) -> Result<T>,
+        F: FnMut(Vec<TopicTransaction>, AHashMap<&'a TransactionID, &'a TopicTransaction>, AHashSet<TransactionID>) -> Result<T>,
     {
         /// Defines what actions we can do to modify a transaction.
         ///
@@ -1320,13 +1321,13 @@ impl Topic {
             PushPrevious(TransactionID),
         }
 
-        let mut tx_index: HashMap<&TransactionID, &TopicTransaction> = HashMap::new();
-        let mut snapshot_unsets: HashMap<TransactionID, Timestamp> = HashMap::new();
+        let mut tx_index: AHashMap<&TransactionID, &TopicTransaction> = AHashMap::new();
+        let mut snapshot_unsets: AHashMap<TransactionID, Timestamp> = AHashMap::new();
         let mut snapshots: Vec<&Snapshot> = Vec::new();
 
         let num_tx = transactions.iter().fold(0, |acc, x| acc + x.len());
         if num_tx == 0 {
-            return cb(Vec::new(), HashMap::new(), HashSet::new());
+            return cb(Vec::new(), AHashMap::new(), AHashSet::new());
         }
 
         for tx_list in transactions {
@@ -1464,7 +1465,7 @@ impl Topic {
         // holds modified transactions
         let mut transactions_modified: Vec<TopicTransaction> = Vec::new();
         // a set of ids of any transactions that have been re-created
-        let mut recreated: HashSet<TransactionID> = HashSet::new();
+        let mut recreated: AHashSet<TransactionID> = AHashSet::new();
         for (tx_id, mut mods) in modifications {
             // get our resurrections first, then clears, then pushes
             mods.sort_unstable();
@@ -1574,7 +1575,7 @@ impl Topic {
                 _ => None,
             })
             .flatten()
-            .collect::<HashSet<_>>();
+            .collect::<AHashSet<_>>();
         let data_ops = ordered
             .into_iter()
             .filter(|t| !has_been_unset.contains(t.id()))
@@ -1636,13 +1637,13 @@ impl Topic {
         let (final_nodes, removed) =
             Self::with_expanded_snapshots(&[self.transactions()], |transactions_modified, tx_index, recreated| {
                 // this tracks nodes that either a) unset other nodes or b) have been unset
-                let mut unsets_in_causal_chain: HashSet<TransactionID> = HashSet::new();
+                let mut unsets_in_causal_chain: AHashSet<TransactionID> = AHashSet::new();
                 // tracks transactions that are part of another snapshot
-                let mut in_existing_snapshot: HashMap<&TransactionID, &SnapshotOrderedOp> = HashMap::new();
+                let mut in_existing_snapshot: AHashMap<&TransactionID, &SnapshotOrderedOp> = AHashMap::new();
                 // track transactions that have been removed as part of other previous snapshots. we
                 // need to do this so we don't go trying to load data from these removals (which will
                 // be expanded to fake transactions by `with_expanded_snapshots()`)
-                let mut previously_snapshotted_removals: HashMap<&TransactionID, &SnapshotOrderedOp> = HashMap::new();
+                let mut previously_snapshotted_removals: AHashMap<&TransactionID, &SnapshotOrderedOp> = AHashMap::new();
                 // a list of transactions that are being removed by this snapshot. this is returned to the
                 // caller so these transactions can be wiped from storage.
                 let mut removed = BTreeSet::new();
@@ -1781,6 +1782,7 @@ impl Topic {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use rayon::prelude::*;
     use stamp_core::{
         crypto::base::{
             rng::{self, ChaCha20Rng, CryptoRng, RngCore},
@@ -1790,10 +1792,14 @@ pub(crate) mod tests {
         identity::keychain::{AdminKey, ExtendKeypair, Key},
     };
     use std::cell::{Ref, RefCell};
+    use std::collections::HashMap;
     use std::ops::Add;
     use std::str::FromStr;
     use std::sync::{mpsc, Arc, Mutex};
-    use tracing::log::{info, warn};
+    use tracing::{
+        log::{info, warn},
+        {event, Level},
+    };
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
     #[allow(dead_code)]
@@ -1871,7 +1877,7 @@ pub(crate) mod tests {
 
     #[allow(dead_code)]
     fn dump_tx(tx: &[(&'static str, &Transaction)]) {
-        let name_map = tx.iter().map(|(name, tx)| (tx.id().clone(), name)).collect::<HashMap<_, _>>();
+        let name_map = tx.iter().map(|(name, tx)| (tx.id().clone(), name)).collect::<AHashMap<_, _>>();
         for (name, trans) in tx {
             #[allow(suspicious_double_ref_op)]
             let tt = TopicTransaction::new(trans.clone().clone());
@@ -1908,7 +1914,7 @@ pub(crate) mod tests {
         let idx = transactions
             .iter()
             .map(|tx| (tx.id().clone(), tx.transaction().entry().created().timestamp()))
-            .collect::<HashMap<_, _>>();
+            .collect::<AHashMap<_, _>>();
 
         struct GraphNode {
             id: String,
@@ -2296,9 +2302,9 @@ pub(crate) mod tests {
 
         fn push_tx<T: Into<TopicTransaction> + Clone + std::fmt::Debug>(
             &self,
-            identities: &HashMap<IdentityID, &Transactions>,
+            identities: &AHashMap<IdentityID, &Transactions>,
             transactions: &[&T],
-        ) -> Result<TopicDagState> {
+        ) -> Result<TopicDagModificationResult> {
             #[allow(suspicious_double_ref_op)]
             let topic_tx = transactions.iter().map(|t| t.clone().clone().into()).collect::<Vec<_>>();
             let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
@@ -2399,7 +2405,7 @@ pub(crate) mod tests {
             .map(|t| t.sign(master_key, admin_key).unwrap())
             .map(|t| TopicTransaction::new(t))
             .collect::<Vec<_>>();
-        let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
+        let identity_map = AHashMap::from([(identity.identity_id().unwrap(), identity)]);
         Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[&crypto_key], &identity_id, device_id)
             .unwrap()
     }
@@ -2426,11 +2432,11 @@ pub(crate) mod tests {
     }
 
     // creates a lookup table for a set of peers
-    fn id_lookup<'a>(peers: &[&'a Peer]) -> HashMap<IdentityID, &'a Transactions> {
+    fn id_lookup<'a>(peers: &[&'a Peer]) -> AHashMap<IdentityID, &'a Transactions> {
         peers
             .iter()
             .map(|p| (p.identity().identity_id().unwrap(), p.identity()))
-            .collect::<HashMap<_, _>>()
+            .collect::<AHashMap<_, _>>()
     }
 
     fn admin_perms() -> Vec<Permission> {
@@ -2517,7 +2523,7 @@ pub(crate) mod tests {
                 .map(|t| TopicTransaction::new(t))
                 .collect::<Vec<_>>();
             let identity_id = transactions.identity_id().unwrap();
-            let identity_map = HashMap::from([(identity_id.clone(), &transactions)]);
+            let identity_map = AHashMap::from([(identity_id.clone(), &transactions)]);
             topic.push_transactions_mut(txt, &identity_map, &master_key, &[&node_a_sync_crypto], &identity_id, member.devices()[0].id())
         };
         {
@@ -3040,26 +3046,26 @@ pub(crate) mod tests {
         let data4 = jerry_laptop.tx_data(ts("2024-12-10T00:00:00Z"), AppData::new("jerry reporting in"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
         }
         let data5 = jerry_laptop.tx_data(ts("2024-12-10T00:01:00Z"), AppData::new("just saw a cat"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
         }
         let data6 = frankie_phone.tx_data(ts("2024-12-10T00:02:00Z"), AppData::new("i hate cats"), None, None);
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
-            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagState::DagUpdated);
+            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagModificationResult::DagUpdated);
+            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagModificationResult::DagUpdated);
         }
 
         assert_eq!(
@@ -3118,11 +3124,26 @@ pub(crate) mod tests {
         // now we combine our hot branches with a cool island merge
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
-            assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
-            assert_eq!(butch_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
-            assert_eq!(dotty_laptop.push_tx(&all_ids_lookup, &[&data4, &data5, &data6]).unwrap(), TopicDagState::DagRebuilt);
-            assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
-            assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(), TopicDagState::DagRebuilt);
+            assert_eq!(
+                butch_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(),
+                TopicDagModificationResult::DagRebuilt
+            );
+            assert_eq!(
+                butch_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(),
+                TopicDagModificationResult::DagRebuilt
+            );
+            assert_eq!(
+                dotty_laptop.push_tx(&all_ids_lookup, &[&data4, &data5, &data6]).unwrap(),
+                TopicDagModificationResult::DagRebuilt
+            );
+            assert_eq!(
+                jerry_laptop.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(),
+                TopicDagModificationResult::DagRebuilt
+            );
+            assert_eq!(
+                frankie_phone.push_tx(&all_ids_lookup, &[&perms1, &perms2]).unwrap(),
+                TopicDagModificationResult::DagRebuilt
+            );
         }
     }
 
@@ -3277,7 +3298,7 @@ pub(crate) mod tests {
         dotty.push_tx(&id_lookup(&[&dotty]), &[&rekey1]).unwrap();
         butch.push_tx(&id_lookup(&[&dotty]), &[&rekey1, &genesis]).unwrap();
 
-        let mut all_tx: HashMap<String, TopicTransaction> = HashMap::new();
+        let mut all_tx: AHashMap<String, TopicTransaction> = AHashMap::new();
         all_tx.insert("gen0".to_string(), genesis.into());
         all_tx.insert("rek1".to_string(), rekey1.into());
         for i in 0..5 {
@@ -3482,7 +3503,7 @@ pub(crate) mod tests {
             #[tracing::instrument(level = "info", skip_all, fields(%iter, peer = %&format!("{}", self.peer().identity().identity_id().unwrap())[0..8]))]
             fn step<R: RngCore + CryptoRng + Clone>(
                 &mut self,
-                lookup: &HashMap<IdentityID, &Transactions>,
+                lookup: &AHashMap<IdentityID, &Transactions>,
                 rng: &mut R,
                 timestamp: Timestamp,
                 iter: usize,
@@ -3503,7 +3524,7 @@ pub(crate) mod tests {
                     .transactions()
                     .iter()
                     .map(|t| t.id().clone())
-                    .collect::<HashSet<_>>();
+                    .collect::<AHashSet<_>>();
 
                 self.peer.push_tx(lookup, &tx_ref)?;
 
@@ -3587,7 +3608,7 @@ pub(crate) mod tests {
                             .iter()
                             .filter_map(|t| t.snapshot().as_ref().map(|s| s.all_transactions()))
                             .flatten()
-                            .collect::<HashSet<_>>();
+                            .collect::<AHashSet<_>>();
                         topic
                             .transactions()
                             .iter()
@@ -3628,20 +3649,28 @@ pub(crate) mod tests {
             }
         }
 
-        fn run_topic(seed: &[u8]) {
-            let mut rng_outer = rng::chacha20_seeded(Hash::new_blake3(seed).unwrap().as_bytes().try_into().unwrap());
+        #[tracing::instrument(level = "warn")]
+        fn run_topic(seed_val: usize) {
+            let seed = format!(
+                "eternal life offers nothing, instead shadowing a neverendingly affluent zombie infestation:{}",
+                seed_val
+            );
+            let mut rng_outer = rng::chacha20_seeded(Hash::new_blake3(seed.as_bytes()).unwrap().as_bytes().try_into().unwrap());
             let rng = &mut rng_outer;
             let mut setup_vals = [0u8; 3];
+            let peer_names = vec![
+                "butch", "dotty", "jerry", "frankie", "timmy", "wookie", "lucy", "sven", "nils", "wendall", "roxanne",
+            ];
             rng.fill_bytes(&mut setup_vals);
-            let num_peers = (setup_vals[0] % 6) as usize + 2;
+            let num_peers = (setup_vals[0] as usize % (peer_names.len() - 2)) + 2;
             let num_iterations = (setup_vals[1] % 80) as usize + 5;
             let chatter_probability = (setup_vals[2] as f32) / (u8::MAX as f32);
+            event!(Level::WARN, num_peers, num_iterations, chatter_probability);
 
             let topic_id = TopicID::new(rng);
 
             let tx_ordered: Arc<Mutex<Vec<(TopicTransaction, Option<AppData>)>>> = Arc::new(Mutex::new(Vec::new()));
 
-            let peer_names = vec!["butch", "dotty", "jerry", "frankie", "timmy", "wookie", "lucy", "sven", "nils"];
             assert!(peer_names.len() >= num_peers);
 
             let mut peers = Vec::new();
@@ -3743,7 +3772,7 @@ pub(crate) mod tests {
                         _ => None,
                     })
                     .flatten()
-                    .collect::<HashSet<_>>();
+                    .collect::<AHashSet<_>>();
                 let ordered_minus_removed = all_tx_clone
                     .iter()
                     .filter(|(tx, _)| !has_been_unset.contains(tx.id()))
@@ -3768,20 +3797,18 @@ pub(crate) mod tests {
             }
         }
 
-        // TODO: rayon thread pool
         let start: usize = std::env::var("CARRIER_PROC_TEST_START")
             .map(|v| v.parse::<usize>().unwrap())
             .unwrap_or(0);
         let end: usize = std::env::var("CARRIER_PROC_TEST_END")
             .map(|v| v.parse::<usize>().unwrap())
-            .unwrap_or(5);
+            .unwrap_or(4);
         if std::env::var("CARRIER_PROC_TEST_LOG") == Ok(String::from("1")) {
             setup();
         }
-        for i in start..end {
-            warn!("run {}", i);
-            run_topic(format!("i like your hat {}", i).as_bytes());
-        }
+
+        warn!("run procedural tests {}..{}", start, end);
+        (start..end).into_par_iter().for_each(|i| run_topic(i));
     }
 
     #[test]

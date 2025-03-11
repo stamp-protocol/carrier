@@ -1,4 +1,4 @@
-.PHONY: all clean lint fmt release doc build run test test-panic test-st macros
+.PHONY: all bench clean lint fmt release doc build run test test-panic test-st macros
 
 # non-versioned include
 VARS ?= vars.mk
@@ -7,6 +7,9 @@ VARS ?= vars.mk
 override CARGO_BUILD_ARGS += --features "$(FEATURES)" --color=always
 
 all: build
+
+bench: fmt
+	cargo bench $(TEST) $(CARGO_BUILD_ARGS) -- --quiet
 
 build: fmt
 	cargo build $(CARGO_BUILD_ARGS)
