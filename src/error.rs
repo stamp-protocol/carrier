@@ -31,6 +31,12 @@ pub enum Error {
     #[error("rekey open failed ({0} / {1:?})")]
     MemberRekeyOpenFailed(TransactionID, DeviceID),
 
+    /// When trying to create a `MemberRekey` entry we ran into a case where a
+    /// member's device was missing from the device -> crypto pubkey mapping which caused a rift in
+    /// the time-space vortex.
+    #[error("rekey generation failed, missing device key map for identity {0} / device {1:?}")]
+    MemberRekeyMissingDevicePubkeyMappingEntry(IdentityID, DeviceID),
+
     /// A packet was encountered that doesn't make any sense
     #[error("invalid packet: {0}")]
     PacketInvalid(TransactionID),

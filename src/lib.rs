@@ -23,8 +23,8 @@ pub enum Permission {
     /// Allows creating new data on the topic.
     #[rasn(tag(explicit(0)))]
     DataSet,
-    /// Allows marking old packets as deleted. This doesn't fully remove the packet (as this might
-    /// break the DAG chain), but does wipe out its data.
+    /// Allows marking data as deleted. Deleted data will be removed once snapshotted via
+    /// [`Topic::snapshot`].
     #[rasn(tag(explicit(1)))]
     DataUnset,
     /// Allows a member to change devices in their own profile.
@@ -38,7 +38,7 @@ pub enum Permission {
     TopicRekey,
 }
 
-/// Represents a unique ID for a member device. Randomly generated.
+/// Represents a unique ID for a member device. Randomly generated, probably.
 #[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[rasn(delegate)]
 pub struct DeviceID(Binary<16>);
@@ -267,23 +267,27 @@ pub struct MemberRekey {
 }
 
 impl MemberRekey {
-    /// Create a new member reykey structure, encrypting the secrets passed in with the member's
+    /// Create a new member rekey structure, encrypting the secrets passed in with the member's
     /// syncing cryptographic public key.
     pub fn seal<R: RngCore + CryptoRng>(
         rng: &mut R,
         member: Member,
-        recipient_crypto_pubkeys: &BTreeMap<&DeviceID, &CryptoKeypairPublic>,
+        device_key_map: &BTreeMap<&DeviceID, &CryptoKeypairPublic>,
         secrets: Vec<SecretEntry>,
     ) -> Result<Self> {
         let secret_ser = secrets.serialize_binary()?;
-        let secrets = recipient_crypto_pubkeys
+        let secrets = member
+            .devices()
             .iter()
-            .map(|(device_id, crypto_pubkey)| {
+            .map(|device| {
+                let crypto_pubkey = device_key_map
+                    .get(device.id())
+                    .ok_or_else(|| Error::MemberRekeyMissingDevicePubkeyMappingEntry(member.identity_id().clone(), device.id().clone()))?;
                 let enc = crypto_pubkey.seal_anonymous(rng, &secret_ser[..]).map_err(|e| Error::Stamp(e))?;
                 #[allow(suspicious_double_ref_op)]
                 let msg = RekeyMessage::new(crypto_pubkey.clone().clone(), enc);
                 #[allow(suspicious_double_ref_op)]
-                Ok((device_id.clone().clone(), msg))
+                Ok((device.id().clone().clone(), msg))
             })
             .collect::<Result<BTreeMap<_, _>>>()?
             .into();
@@ -747,7 +751,7 @@ impl std::fmt::Display for TopicID {
 /// So the purpose of tracking per-branch state is to make sure that transactions that are valid
 /// given their ancestry will actually validate, as opposed to building a single global state and
 /// discarding transactions that might have been valid in their context but then get invalidated
-/// due to another branch. This of state tracking, although much more involved and less performant,
+/// due to another branch. This way of state tracking, although much more involved and less performant,
 /// significantly decreases the risk of causing invalid transactions. It's a much more permissive
 /// model. Yes, it's vulnerable to someone branching off of `E` to add their data and purposefully
 /// not including `B` or its descendants to avoid permissions adjustments. However, in the case of
@@ -967,6 +971,10 @@ pub struct Topic {
     /// transactions to have branch-local validation as opposed to requiring consistent state. This
     /// mapping exists largely as a cache so we don't have to re-run all the transactions from
     /// start to finish each time we need to add a new transaction to the topic.
+    ///
+    /// Obviously if we have a lot of complex branches and a TON of members on a topic, this is
+    /// going to get pretty burly, but do you want to lose a few MB of memory, or do you want your
+    /// precious CPU churning through the night?
     branch_state: HashMap<TransactionID, TopicState>,
     /// Tracks the tail references of the most recent state update to the topic DAG. You mostly
     /// shouldn't think about this at all since its function is purely for internal optimization.
@@ -1013,17 +1021,18 @@ impl Topic {
     ///
     /// This does not apply the packet, it's your responsibility to call [`Topic::transaction_from_packet()`]
     /// / [`Topic::push_transactions()`] yourself.
-    #[tracing::instrument(err, skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], members = %members.iter().map(|(m, _)| String::from(&format!("{}", m.identity_id())[0..8])).collect::<Vec<_>>().join(",")))]
+    #[tracing::instrument(err, skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], members = %members.iter().map(|m| String::from(&format!("{}", m.identity_id())[0..8])).collect::<Vec<_>>().join(",")))]
     pub fn rekey<R: RngCore + CryptoRng>(
         &self,
         rng: &mut R,
-        members: Vec<(Member, &BTreeMap<&DeviceID, &CryptoKeypairPublic>)>,
+        members: Vec<Member>,
+        device_key_map: &BTreeMap<&DeviceID, &CryptoKeypairPublic>,
     ) -> Result<Packet> {
         let mut secrets = self.secrets().clone();
         secrets.push(SecretEntry::new_current_transaction(TopicSecret::new(rng)));
         let rekeys = members
             .into_iter()
-            .map(|(member, recipient_device_pubkeys)| MemberRekey::seal(rng, member, recipient_device_pubkeys, secrets.clone()))
+            .map(|member| MemberRekey::seal(rng, member, device_key_map, secrets.clone()))
             .collect::<Result<Vec<_>>>()?;
         Ok(Packet::TopicRekey { members: rekeys })
     }
@@ -1561,7 +1570,7 @@ impl Topic {
         Ok(output)
     }
 
-    /// Returns all `DataSet` operations, in order, decrypted.
+    /// Returns all active (ie, non-removed) `DataSet` operations, in order, decrypted.
     pub fn get_data<T>(&self) -> Result<Vec<Result<T>>>
     where
         T: SerdeBinary,
@@ -1781,7 +1790,7 @@ impl Topic {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use rayon::prelude::*;
+    use rayon::ThreadPoolBuilder;
     use stamp_core::{
         crypto::base::{
             rng::{self, ChaCha20Rng, CryptoRng, RngCore},
@@ -1796,7 +1805,7 @@ pub(crate) mod tests {
     use std::str::FromStr;
     use std::sync::{mpsc, Arc, Mutex};
     use tracing::{
-        log::{info, warn},
+        log::{debug, info, warn},
         {event, Level},
     };
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -2198,34 +2207,20 @@ pub(crate) mod tests {
                 Self::passphrase_to_key(master_passphrase),
             );
 
-            let identity = transactions.build_identity().unwrap();
-            let sign_key = identity
-                .keychain()
-                .subkey_by_name("/stamp/sync/v1/sign")
-                .unwrap()
-                .key()
-                .as_signkey()
-                .unwrap();
-
             let device = Device::new(&mut rng, device_name.into());
-            let crypto_keys = (0..5)
-                .into_iter()
-                .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap())
-                .collect::<Vec<_>>();
-            let key_packets = crypto_keys
-                .iter()
-                .map(|k| KeyPacket::new(&master_key, sign_key, identity.id().clone(), device.id().clone(), k.clone().into()).unwrap())
-                .collect::<Vec<_>>();
-            Self {
+
+            let mut peer = Self {
                 rng,
                 topic: RefCell::new(topic),
                 master_passphrase,
                 master_key,
                 identity: transactions,
                 device,
-                crypto_keys,
-                key_packets,
-            }
+                crypto_keys: Vec::new(),
+                key_packets: Vec::new(),
+            };
+            peer.generate_key_packets(5);
+            peer
         }
 
         fn new_device(&mut self, device_name: &str) -> Self {
@@ -2235,7 +2230,28 @@ pub(crate) mod tests {
 
             let topic = Topic::new(self.topic().id().clone());
             let master_key = Self::passphrase_to_key(self.master_passphrase());
+            let device = Device::new(&mut rng, device_name.into());
 
+            let mut peer = Self {
+                rng,
+                topic: RefCell::new(topic),
+                master_passphrase: self.master_passphrase(),
+                master_key,
+                identity: self.identity.clone(),
+                device,
+                crypto_keys: Vec::new(),
+                key_packets: Vec::new(),
+            };
+            peer.generate_key_packets(5);
+            peer
+        }
+
+        fn as_member(&self, permissions: Vec<Permission>, devices: Vec<Device>) -> Member {
+            Member::new(self.identity().identity_id().unwrap().clone(), permissions, devices)
+        }
+
+        fn generate_key_packets(&mut self, num_keys: usize) {
+            let master_key = self.master_key().clone();
             let identity = self.identity().build_identity().unwrap();
             let sign_key = identity
                 .keychain()
@@ -2245,30 +2261,19 @@ pub(crate) mod tests {
                 .as_signkey()
                 .unwrap();
 
-            let device = Device::new(&mut rng, device_name.into());
-            let crypto_keys = (0..5)
+            let mut crypto_keys = (0..num_keys)
                 .into_iter()
-                .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap())
+                .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(self.rng_mut(), &master_key).unwrap())
                 .collect::<Vec<_>>();
-            let key_packets = crypto_keys
+            let mut key_packets = crypto_keys
                 .iter()
-                .map(|k| KeyPacket::new(&master_key, sign_key, identity.id().clone(), device.id().clone(), k.clone().into()).unwrap())
+                .map(|k| {
+                    KeyPacket::new(self.master_key(), sign_key, identity.id().clone(), self.device().id().clone(), k.clone().into())
+                        .unwrap()
+                })
                 .collect::<Vec<_>>();
-
-            Self {
-                rng,
-                topic: RefCell::new(topic),
-                master_passphrase: self.master_passphrase(),
-                master_key,
-                identity: self.identity.clone(),
-                device,
-                crypto_keys,
-                key_packets,
-            }
-        }
-
-        fn as_member(&self, permissions: Vec<Permission>, devices: Vec<Device>) -> Member {
-            Member::new(self.identity().identity_id().unwrap().clone(), permissions, devices)
+            self.crypto_keys_mut().append(&mut crypto_keys);
+            self.key_packets_mut().append(&mut key_packets);
         }
 
         fn tx(&self, now: Timestamp, prev: Option<Vec<TransactionID>>, packet: Packet) -> Transaction {
@@ -2448,12 +2453,25 @@ pub(crate) mod tests {
         ]
     }
 
+    macro_rules! rekey_args {
+        ($member_def:expr) => {{
+            let member_defs = $member_def;
+            let key_lookup: BTreeMap<&DeviceID, &CryptoKeypairPublic> = member_defs
+                .iter()
+                .map(|(_, lookup)| lookup.into_iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>())
+                .flatten()
+                .collect();
+            let members = member_defs.into_iter().map(|(m, _)| m).collect::<Vec<_>>();
+            (members, key_lookup)
+        }};
+    }
+
     // reduces some boilerplate when creating re-key entries
     macro_rules! rkmember {
         ($peer:expr, $permissions:expr, $keyidx:expr) => {
             (
                 $peer.as_member($permissions, vec![$peer.device().clone()]),
-                &device_lookup(&[&$peer.key_packets()[$keyidx]]),
+                device_lookup(&[&$peer.key_packets()[$keyidx]]),
             )
         };
     }
@@ -2696,10 +2714,8 @@ pub(crate) mod tests {
         let mut frankie_phone = Peer::new_identity(&mut rng, &topic_id, "frankiehankie", "phone");
 
         let genesis = {
-            let packet = butch_laptop
-                .topic()
-                .rekey(&mut rng, vec![rkmember!(&butch_laptop, admin_perms(), 0)])
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch_laptop, admin_perms(), 0),]);
+            let packet = butch_laptop.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
 
@@ -2744,16 +2760,11 @@ pub(crate) mod tests {
         assert_eq!(butch_laptop.topic().secrets().len(), 1);
 
         let rekey1 = {
-            let packet = butch_laptop
-                .topic()
-                .rekey(
-                    &mut rng,
-                    vec![
-                        rkmember!(&butch_laptop, admin_perms(), 0),
-                        rkmember!(&dotty_laptop, admin_perms(), 0),
-                    ],
-                )
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![
+                rkmember!(&butch_laptop, admin_perms(), 0),
+                rkmember!(&dotty_laptop, admin_perms(), 0),
+            ]);
+            let packet = butch_laptop.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
 
@@ -2898,21 +2909,16 @@ pub(crate) mod tests {
 
         // now add butch's phone, jerry, and frankie to the topic
         let rekey2 = {
-            let packet = butch_laptop
-                .topic()
-                .rekey(
-                    &mut rng,
-                    vec![
-                        (
-                            butch_laptop.as_member(admin_perms(), vec![butch_laptop.device().clone(), butch_phone.device().clone()]),
-                            &device_lookup(&[&butch_laptop.key_packets()[0], &butch_phone.key_packets()[0]]),
-                        ),
-                        rkmember!(&dotty_laptop, admin_perms(), 0),
-                        rkmember!(&jerry_laptop, vec![Permission::DataSet, Permission::DataUnset], 0),
-                        rkmember!(&frankie_phone, vec![Permission::DataSet, Permission::DataUnset], 0),
-                    ],
-                )
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![
+                (
+                    butch_laptop.as_member(admin_perms(), vec![butch_laptop.device().clone(), butch_phone.device().clone()]),
+                    device_lookup(&[&butch_laptop.key_packets()[0], &butch_phone.key_packets()[0]]),
+                ),
+                rkmember!(&dotty_laptop, admin_perms(), 0),
+                rkmember!(&jerry_laptop, vec![Permission::DataSet, Permission::DataUnset], 0),
+                rkmember!(&frankie_phone, vec![Permission::DataSet, Permission::DataUnset], 0),
+            ]);
+            let packet = butch_laptop.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch_laptop.tx(ts("2024-12-09T00:00:00Z"), None, packet)
         };
 
@@ -3153,16 +3159,15 @@ pub(crate) mod tests {
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "butch6969", "laptop");
         let genesis = {
-            let packet = dotty.topic().rekey(&mut rng, vec![rkmember!(&dotty, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0)]);
+            let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         dotty.push_tx(&id_lookup(&[&dotty]), &[&genesis]).unwrap();
 
         let rekey1 = {
-            let packet = dotty
-                .topic()
-                .rekey(&mut rng, vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)])
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)]);
+            let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet)
         };
 
@@ -3283,15 +3288,14 @@ pub(crate) mod tests {
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "butch6969", "laptop");
         let genesis = {
-            let packet = dotty.topic().rekey(&mut rng, vec![rkmember!(&dotty, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0)]);
+            let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         dotty.push_tx(&id_lookup(&[&dotty]), &[&genesis]).unwrap();
         let rekey1 = {
-            let packet = dotty
-                .topic()
-                .rekey(&mut rng, vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)])
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)]);
+            let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet)
         };
         dotty.push_tx(&id_lookup(&[&dotty]), &[&rekey1]).unwrap();
@@ -3503,6 +3507,7 @@ pub(crate) mod tests {
             fn step<R: RngCore + CryptoRng + Clone>(
                 &mut self,
                 lookup: &HashMap<IdentityID, &Transactions>,
+                keyserver: &mut HashMap<DeviceID, Vec<KeyPacket>>,
                 rng: &mut R,
                 timestamp: Timestamp,
                 iter: usize,
@@ -3545,7 +3550,7 @@ pub(crate) mod tests {
                 // add a new transaction?
                 if probability(rng, 0.5) {
                     let tx_data = AppData::new(format!("{} -- {}", self.peer().device().name(), iter));
-                    let tx = TopicTransaction::new(self.peer_mut().tx_data(timestamp, tx_data.clone(), None, None));
+                    let tx = TopicTransaction::new(self.peer_mut().tx_data(timestamp.clone(), tx_data.clone(), None, None));
                     info!(
                         "new tx {} [{}] :: \"{}\"",
                         &format!("{}", tx.id())[0..8],
@@ -3569,33 +3574,39 @@ pub(crate) mod tests {
                             .filter(|t| t.is_data_packet().unwrap())
                             .map(|t| t.id().clone())
                             .collect::<Vec<_>>();
-                        tx_ids.sort_unstable();
-                        let mut removals = Vec::with_capacity(5);
-                        for _ in 0..(choice(rng, 3) + 1) {
-                            // we could try to get UNIQUE transaction ids but i really don't care
-                            // that much TBH
-                            removals.push(tx_ids[choice(rng, tx_ids.len() - 1) + 1].clone());
+                        if tx_ids.len() > 0 {
+                            tx_ids.sort_unstable();
+                            let mut removals = Vec::with_capacity(5);
+                            for _ in 0..(choice(rng, 3) + 1) {
+                                // we could try to get UNIQUE transaction ids but i really don't care
+                                // that much TBH
+                                removals.push(tx_ids[choice(rng, tx_ids.len())].clone());
+                            }
+                            removals
+                        } else {
+                            Vec::new()
                         }
-                        removals
                     };
-                    let tx_rm = TopicTransaction::new(self.peer().tx(
-                        timestamp,
-                        None,
-                        Packet::DataUnset {
-                            transaction_ids: removals.clone(),
-                        },
-                    ));
-                    info!(
-                        "rm {} [{}]",
-                        &format!("{}", tx_rm.id())[0..8],
-                        removals
-                            .iter()
-                            .map(|p| String::from(&format!("{}", p)[0..8]))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                    self.peer().push_tx(lookup, &[&tx_rm])?;
-                    tx_return.push((tx_rm, None));
+                    if removals.len() > 0 {
+                        let tx_rm = TopicTransaction::new(self.peer().tx(
+                            timestamp.clone(),
+                            None,
+                            Packet::DataUnset {
+                                transaction_ids: removals.clone(),
+                            },
+                        ));
+                        info!(
+                            "rm {} [{}]",
+                            &format!("{}", tx_rm.id())[0..8],
+                            removals
+                                .iter()
+                                .map(|p| String::from(&format!("{}", p)[0..8]))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        self.peer().push_tx(lookup, &[&tx_rm])?;
+                        tx_return.push((tx_rm, None));
+                    }
                 }
 
                 // create snapshot?
@@ -3644,6 +3655,55 @@ pub(crate) mod tests {
                         );
                     }
                 }
+
+                // re-key the topic
+                if probability(rng, 0.004) {
+                    info!(
+                        "rekey {} peers: [{}]",
+                        self.peer().topic().state().members().len(),
+                        keyserver
+                            .values()
+                            .map(|pkts| format!("{}", pkts.len()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let (packet, device_list) = {
+                        let topic = self.peer().topic();
+                        let members = topic.state().members().values().cloned().collect::<Vec<_>>();
+                        let device_key_map = members
+                            .iter()
+                            .map(|member| {
+                                member.devices().iter().map(|device| {
+                                    (
+                                        device.id().clone(),
+                                        keyserver
+                                            .get(device.id())
+                                            .expect("missing keyserver entry")
+                                            .get(0)
+                                            .expect("empty keypackets")
+                                            .entry()
+                                            .pubkey(),
+                                    )
+                                })
+                            })
+                            .flatten()
+                            .collect::<BTreeMap<_, _>>();
+                        let device_map_ref = device_key_map.iter().map(|(d, p)| (d, *p)).collect::<BTreeMap<_, _>>();
+                        (
+                            self.peer().topic().rekey(rng, members, &device_map_ref)?,
+                            device_key_map.keys().cloned().collect::<Vec<_>>(),
+                        )
+                    };
+                    let tx_rekey = TopicTransaction::new(self.peer().tx(timestamp.clone(), None, packet));
+                    self.peer().push_tx(lookup, &[&tx_rekey])?;
+                    tx_return.push((tx_rekey, None));
+                    for device_id in device_list {
+                        keyserver
+                            .get_mut(&device_id)
+                            .expect("expected keyserver entry for removal")
+                            .remove(0);
+                    }
+                }
                 Ok(tx_return)
             }
         }
@@ -3672,9 +3732,11 @@ pub(crate) mod tests {
 
             assert!(peer_names.len() >= num_peers);
 
+            let mut keyserver: HashMap<DeviceID, Vec<KeyPacket>> = HashMap::new();
             let mut peers = Vec::new();
             for i in 0..num_peers {
                 let peer = PeerOuter::new(Peer::new_identity(rng, &topic_id, "PASSWORD1", peer_names[i]));
+                keyserver.insert(peer.peer().device().id().clone(), peer.peer().key_packets().clone());
                 peers.push(peer);
             }
 
@@ -3694,11 +3756,8 @@ pub(crate) mod tests {
                         )
                     })
                     .collect::<Vec<_>>();
-                let packet = peers[0]
-                    .peer()
-                    .topic()
-                    .rekey(rng, rekey_entries.iter().map(|(x, y)| (x.clone(), y)).collect::<Vec<_>>())
-                    .unwrap();
+                let (members, key_lookup) = rekey_args!(rekey_entries.iter().map(|(x, y)| (x.clone(), y)).collect::<Vec<_>>());
+                let packet = peers[0].peer().topic().rekey(rng, members, &key_lookup).unwrap();
                 TopicTransaction::new(peers[0].peer().tx(ts_next(), None, packet))
             };
 
@@ -3713,8 +3772,21 @@ pub(crate) mod tests {
                 let ts = ts_next();
                 // this will house any returned transactions from each of the peers as we step them
                 let mut transactions = Vec::new();
+                // make sure our keyserver has fresh entries
+                for (device_id, key_packets) in keyserver.iter_mut() {
+                    let key_packet_cutoff = peers.len() + 1;
+                    if key_packets.len() < key_packet_cutoff {
+                        let peer = peers
+                            .iter_mut()
+                            .find(|p| p.peer().device().id() == device_id)
+                            .expect("missing peer device when creating keypackets");
+                        debug!("Peer({}) -- regenerate key packets and upload", peer.peer().identity().identity_id().unwrap());
+                        peer.peer_mut().generate_key_packets(key_packet_cutoff);
+                        key_packets.append(&mut peer.peer_mut().key_packets_mut().drain(..).collect());
+                    }
+                }
                 for peer in &mut peers {
-                    let mut output = peer.step(&peers_lookup, rng, ts.clone(), i).unwrap();
+                    let mut output = peer.step(&peers_lookup, &mut keyserver, rng, ts.clone(), i).unwrap();
                     // append any transaction this peer returned into our run-local list
                     transactions.append(&mut output);
                 }
@@ -3807,7 +3879,12 @@ pub(crate) mod tests {
         }
 
         warn!("run procedural tests {}..{}", start, end);
-        (start..end).into_par_iter().for_each(|i| run_topic(i));
+        let pool = ThreadPoolBuilder::new().build().unwrap();
+        pool.scope_fifo(move |s| {
+            for i in start..end {
+                s.spawn_fifo(move |_| run_topic(i));
+            }
+        })
     }
 
     #[test]
@@ -4080,7 +4157,8 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let genesis = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4106,7 +4184,8 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let genesis = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4187,7 +4266,8 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let genesis = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4236,7 +4316,8 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let genesis = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4269,10 +4350,8 @@ pub(crate) mod tests {
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dupephone");
         let genesis = {
-            let packet = butch
-                .topic()
-                .rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)])
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2012-03-04T09:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4324,10 +4403,8 @@ pub(crate) mod tests {
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dupephone");
         let genesis = {
-            let packet = butch
-                .topic()
-                .rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)])
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4375,10 +4452,8 @@ pub(crate) mod tests {
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dotty");
         let genesis = {
-            let packet = butch
-                .topic()
-                .rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)])
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
@@ -4490,17 +4565,12 @@ pub(crate) mod tests {
         // E -> H
 
         let tx_a = {
-            let packet = butch
-                .topic()
-                .rekey(
-                    &mut rng,
-                    vec![
-                        rkmember!(&butch, admin_perms(), 0),
-                        rkmember!(&dotty, admin_perms(), 0),
-                        rkmember!(&jerry, vec![], 0),
-                    ],
-                )
-                .unwrap();
+            let (members, key_lookup) = rekey_args!(vec![
+                rkmember!(&butch, admin_perms(), 0),
+                rkmember!(&dotty, admin_perms(), 0),
+                rkmember!(&jerry, vec![], 0),
+            ]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
@@ -4621,7 +4691,8 @@ pub(crate) mod tests {
         // B -> D
 
         let tx_a = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
@@ -4660,7 +4731,8 @@ pub(crate) mod tests {
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
 
         let tx_a = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
@@ -4707,7 +4779,8 @@ pub(crate) mod tests {
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
 
         let tx_a = {
-            let packet = butch.topic().rekey(&mut rng, vec![rkmember!(&butch, admin_perms(), 0)]).unwrap();
+            let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
+            let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
