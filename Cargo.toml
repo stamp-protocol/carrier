@@ -7,7 +7,7 @@ edition = "2021"
 chrono = "0.4"
 getset = "0.1"
 rasn = "0.20"
-stamp-core = { path = "../../core" }
+stamp-core = { path = "../core" }
 thiserror = "1.0"
 tracing = { version = "0.1", features = ["log"] }
 
