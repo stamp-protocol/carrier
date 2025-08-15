@@ -3,7 +3,7 @@
 pub mod error;
 
 use crate::error::{Error, Result};
-use rasn::{AsnType, Decode, Encode};
+use rasn::{AsnType, Decode, Decoder, Encode, Encoder};
 use stamp_core::{
     crypto::base::{
         rng::{CryptoRng, RngCore},
@@ -44,7 +44,7 @@ pub enum Permission {
 pub struct DeviceID(Binary<16>);
 
 impl DeviceID {
-    /// Create a new random TopicID.
+    /// Create a new random `DeviceID`.
     pub fn new<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut randbuf = [0u8; 16];
         rng.fill_bytes(&mut randbuf);
@@ -54,7 +54,7 @@ impl DeviceID {
 
 impl SerdeBinary for DeviceID {}
 
-/// Represent's a member's device.
+/// Represents a member's device.
 #[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct Device {
@@ -67,7 +67,7 @@ pub struct Device {
 }
 
 impl Device {
-    /// Create a new random TopicID.
+    /// Create a new `Device` with a random ID
     pub fn new<R: RngCore + CryptoRng>(rng: &mut R, name: String) -> Self {
         let id = DeviceID::new(rng);
         Self { id, name }
@@ -185,7 +185,7 @@ pub struct KeyPacket {
     /// Holds the actual key packet data (basically a crypto public key)
     #[rasn(tag(explicit(1)))]
     entry: KeyPacketEntry,
-    /// A signature on the `id` field (the hash of the entry), signed yb a well-known sync signing
+    /// A signature on the `id` field (the hash of the entry), signed by a well-known sync signing
     /// key.
     #[rasn(tag(explicit(2)))]
     signature: SignKeypairSignature,
@@ -349,7 +349,7 @@ pub enum Packet {
     },
     /// Allows a member to add/remove devices to their own profile. We omit the identity id of the
     /// member being modified because members can only update their own devices with this
-    /// permission, so the identity id is stored in the transaction carrying the packet.
+    /// message, so the identity id is stored in the transaction carrying the packet.
     #[rasn(tag(explicit(2)))]
     MemberDevicesUpdate {
         /// The member's device list
@@ -712,6 +712,14 @@ impl TopicID {
     /// Create a `TopicID` from a byte array.
     pub fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(Binary::new(bytes))
+    }
+}
+
+impl Deref for TopicID {
+    type Target = [u8; 16];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.deref()
     }
 }
 
@@ -3154,7 +3162,7 @@ pub(crate) mod tests {
 
     #[test]
     fn topic_dag_rebuild_with_snapshot() {
-        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe").unwrap().as_bytes().try_into().unwrap());
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe.").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "butch6969", "laptop");
@@ -4541,7 +4549,7 @@ pub(crate) mod tests {
     // the DAG but doesn't try to actually read the empty packet data.
     #[test]
     fn topic_branch_merge_branch_rm() {
-        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATS").unwrap().as_bytes().try_into().unwrap());
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATSz").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dotty");

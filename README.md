@@ -21,6 +21,13 @@ needing to trust an always-connected third peer.
 Topics employ post-compromise security (as in, all members can be re-keyed in the event of a breach), but
 *do not* implement forward secrecy as this is counterproductive to shared datasets (more on this later).
 
+## Design goals
+
+TODO: details
+
+- Usability and consistency over permissions security
+- Ease of syncing
+
 ## Transactions
 
 A topic consists of control transactions (which re-key the topic and update member devices/permissions) as well
