@@ -16,6 +16,3 @@ criterion = "0.4.0"
 rayon = "1.10"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[[bench]]
-name = "hash"
-harness = false

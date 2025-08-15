@@ -447,7 +447,6 @@ impl SnapshotOrderedOp {
 pub struct SnapshotEntry {
     /// The operations we're rolling into this snapshot **in causal order**. This is effectively
     /// all operations that have occurred before the operation being snapshotted *on the same DAG
-
     /// *not* in any of the backlinks should *not* be snapshotted.
     ///
     /// Note although the snapshot erases nodes that are unsets or are targets of unsets, we will
@@ -909,7 +908,7 @@ impl TopicState {
                 self.members_mut()
                     .get_mut(&identity_id_changee)
                     .map(|member| member.set_permissions(new_permissions))
-                    .ok_or_else(|| Error::MemberNotFound(identity_id_changee))?;
+                    .ok_or(Error::MemberNotFound(identity_id_changee))?;
             }
             Packet::TopicRekey { members } => {
                 // every rekey necessarily rebuilds the entire member set
@@ -1441,7 +1440,7 @@ impl Topic {
                                         mods.push(Modification::ClearPrevious);
                                         mods.push(Modification::PushPrevious(prev_tx_id.clone()));
                                     }
-                                } else if prev_current.len() != 0 {
+                                } else if !prev_current.is_empty() {
                                     // the prev list is blank, but our tx has a non-blank prev.
                                     // we need to clear the prev tx for this tx
                                     mods.push(Modification::ClearPrevious);
@@ -1469,7 +1468,7 @@ impl Topic {
                         }
                     }
                 };
-                if mods.len() > 0 {
+                if !mods.is_empty() {
                     let mods_entry = modifications.entry(snap_op.transaction_id().clone()).or_insert_with(|| Vec::new());
                     mods_entry.append(&mut mods);
                 }
@@ -1513,15 +1512,13 @@ impl Topic {
                 };
                 recreated.insert(tx_id.clone());
                 topic_trans
+            } else if let Some(tx) = tx_index.get(&tx_id) {
+                #[allow(suspicious_double_ref_op)]
+                tx.clone().clone()
             } else {
-                if let Some(tx) = tx_index.get(&tx_id) {
-                    #[allow(suspicious_double_ref_op)]
-                    tx.clone().clone()
-                } else {
-                    // this transaction doesn't exist in our index and we don't have any
-                    // resurrect actions for it. that's an error =[
-                    Err(Error::TopicMissingTransactions(vec![tx_id.clone()]))?
-                }
+                // this transaction doesn't exist in our index and we don't have any
+                // resurrect actions for it. that's an error =[
+                Err(Error::TopicMissingTransactions(vec![tx_id.clone()]))?
             };
 
             let mut previous: BTreeSet<TransactionID> = tx.previous_transactions()?.into_iter().cloned().collect();
@@ -1598,7 +1595,7 @@ impl Topic {
             .map(|t| match t.get_packet() {
                 Ok(packet) => match packet {
                     Packet::DataSet { key_ref, payload } => {
-                        let secret_key = self.keychain.get(&key_ref).ok_or_else(|| Error::TopicSecretNotFound(key_ref))?;
+                        let secret_key = self.keychain.get(&key_ref).ok_or(Error::TopicSecretNotFound(key_ref))?;
                         let plaintext = secret_key.open(&payload)?;
                         let des = T::deserialize_binary(&plaintext)?;
                         Ok(Some(des))
@@ -1634,7 +1631,7 @@ impl Topic {
     ///
     /// This returns a list of all operations that have been removed by the snapshot process,
     /// allowing deletion in whatever storage mechanism.
-    #[tracing::instrument(ret, err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], replaces = %&format!("{}", replaces)[0..8]))]
+    #[tracing::instrument(ret, err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], replaces = %&format!("{replaces}")[0..8]))]
     pub fn snapshot(
         &mut self,
         master_key: &SecretKey,
@@ -1824,7 +1821,7 @@ pub(crate) mod tests {
             .with(fmt::layer().with_span_events(fmt::format::FmtSpan::CLOSE))
             .with(EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info")).unwrap())
             .try_init()
-            .unwrap_or_else(|_| ())
+            .unwrap_or(())
     }
 
     fn ts(time: &str) -> Timestamp {
@@ -1903,7 +1900,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|prev| {
                     let name = name_map.get(prev).unwrap_or(&&"<missing>");
-                    format!("{}", name)
+                    name.to_string()
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1923,7 +1920,7 @@ pub(crate) mod tests {
         // 7 because we use the timestamp as a mod and nobody is divisible by 7
         let link_colors = ["#0066ff", "#009933", "#9900cc", "#e6b800", "#0066ff", "#009933", "#9900cc"];
 
-        let short = |txid: &TransactionID| -> String { format!("{}", txid)[0..8].replace("-", "_") };
+        let short = |txid: &TransactionID| -> String { format!("{txid}")[0..8].replace("-", "_") };
 
         let mut transactions = Vec::from(transactions);
         transactions.sort_unstable_by(|a, b| a.transaction().cmp(b.transaction()));
@@ -1950,10 +1947,10 @@ pub(crate) mod tests {
                     if let Some(snap) = tx.snapshot().as_ref() {
                         format!(" ({})", snap.entry().ordered_transactions().len())
                     } else {
-                        format!("")
+                        String::new()
                     }
                 ),
-                fill: if tx.snapshot().is_some() { Some(format!("#cc8")) } else { None },
+                fill: if tx.snapshot().is_some() { Some("#cc8".to_string()) } else { None },
             })
             .collect::<Vec<_>>();
         let mut grouped = BTreeMap::new();
@@ -1972,7 +1969,7 @@ pub(crate) mod tests {
                     link_colors
                         .iter()
                         .enumerate()
-                        .map(|(i, color)| format!("link{}: {{ style.stroke: '{}' }}", i, color))
+                        .map(|(i, color)| format!("link{i}: {{ style.stroke: '{color}' }}"))
                         .collect::<Vec<_>>()
                         .join("; ")
                 );
@@ -1999,10 +1996,10 @@ pub(crate) mod tests {
         for (ypos, nodes) in grouped.iter() {
             match output {
                 Output::D2 => {
-                    println!("t-{} {{  grid-rows: 1; label.near: top-right;", ypos);
+                    println!("t-{ypos} {{  grid-rows: 1; label.near: top-right;");
                 }
                 Output::Mermaid => {
-                    println!("subgraph t-{}", ypos);
+                    println!("subgraph t-{ypos}");
                     println!("direction TB");
                 }
                 _ => {}
@@ -2028,12 +2025,7 @@ pub(crate) mod tests {
                         }
                     }
                     Output::PlantUML => {
-                        println!(
-                            "rectangle {} as \"{}\" {}",
-                            node.id,
-                            node.title,
-                            node.fill.as_ref().map(|x| x.as_str()).unwrap_or("")
-                        );
+                        println!("rectangle {} as \"{}\" {}", node.id, node.title, node.fill.as_deref().unwrap_or(""));
                     }
                 }
             }
@@ -2044,18 +2036,15 @@ pub(crate) mod tests {
                 Output::Mermaid => {
                     println!("end");
                     if let Some(last) = last_ypos {
-                        println!("t-{} ~~~ t-{}", last, ypos);
+                        println!("t-{last} ~~~ t-{ypos}");
                     }
                 }
                 _ => {}
             }
             last_ypos = Some(ypos);
         }
-        match output {
-            Output::D2 => {
-                println!("}}");
-            }
-            _ => {}
+        if output == Output::D2 {
+            println!("}}");
         }
         for tx in &transactions {
             let ypos = tx.transaction().entry().created().timestamp();
@@ -2083,18 +2072,15 @@ pub(crate) mod tests {
                 }
             }
         }
-        match output {
-            Output::PlantUML => {
-                println!("@enduml");
-            }
-            _ => {}
+        if output == Output::PlantUML {
+            println!("@enduml");
         }
     }
 
     #[allow(dead_code)]
     fn dump_dag_expanded(transactions: &[&[TopicTransaction]]) {
         fn short(txid: &TransactionID) -> String {
-            format!("{}", txid)[0..8].replace("-", "_")
+            format!("{txid}")[0..8].replace("-", "_")
         }
 
         Topic::with_expanded_snapshots(transactions, |modified, _idx, _recreated| {
@@ -2270,7 +2256,6 @@ pub(crate) mod tests {
                 .unwrap();
 
             let mut crypto_keys = (0..num_keys)
-                .into_iter()
                 .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(self.rng_mut(), &master_key).unwrap())
                 .collect::<Vec<_>>();
             let mut key_packets = crypto_keys
@@ -2354,7 +2339,7 @@ pub(crate) mod tests {
                 .unwrap();
             let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
             let mut topic = self.topic.replace(fake_topic);
-            let res = match topic.snapshot(self.master_key(), &sign_key, replaces) {
+            let res = match topic.snapshot(self.master_key(), sign_key, replaces) {
                 Ok(res) => {
                     self.topic.replace(topic);
                     res
@@ -2418,7 +2403,7 @@ pub(crate) mod tests {
             .map(|t| TopicTransaction::new(t))
             .collect::<Vec<_>>();
         let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
-        Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[&crypto_key], &identity_id, device_id)
+        Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[crypto_key], &identity_id, device_id)
             .unwrap()
     }
 
@@ -2596,7 +2581,7 @@ pub(crate) mod tests {
             let res = packet.verify(&node_a_sync_sig.clone().into());
             match res {
                 Err(Error::KeyPacketTampered) => {}
-                _ => panic!("unexpected: {:?}", res),
+                _ => panic!("unexpected: {res:?}"),
             }
         }
     }
@@ -2746,7 +2731,7 @@ pub(crate) mod tests {
                 Err(Error::IdentityMissing(id)) => {
                     assert_eq!(id, butch_laptop.identity().identity_id().unwrap());
                 }
-                _ => panic!("unexpected: {:?}", res),
+                _ => panic!("unexpected: {res:?}"),
             }
         }
         butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[&genesis]).unwrap();
@@ -2812,7 +2797,7 @@ pub(crate) mod tests {
                         Err(Error::IdentityMissing(ref id)) => {
                             assert_eq!(id, &butch_laptop.identity().identity_id().unwrap());
                         }
-                        _ => panic!("unexpected: {:?}", res),
+                        _ => panic!("unexpected: {res:?}"),
                     }
                 }
             }
@@ -2837,7 +2822,7 @@ pub(crate) mod tests {
                         Err(Error::TopicSecretNotFound(txid)) => {
                             assert_eq!(txid, genesis.id().clone());
                         }
-                        _ => panic!("unexpected: {:?}", res),
+                        _ => panic!("unexpected: {res:?}"),
                     }
                 }
             }
@@ -2888,7 +2873,7 @@ pub(crate) mod tests {
                 Err(Error::TopicMissingTransactions(txids)) => {
                     assert_eq!(txids, vec![data2.id().clone()]);
                 }
-                _ => panic!("unexpected: {:?}", res),
+                _ => panic!("unexpected: {res:?}"),
             }
         }
 
@@ -3314,28 +3299,28 @@ pub(crate) mod tests {
         all_tx.insert("rek1".to_string(), rekey1.into());
         for i in 0..5 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.000Z", i * 2);
-            let data = butch.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {}", i)), None, None);
+            let data = butch.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {i}")), None, None);
             butch.push_tx(&id_lookup(&[&butch]), &[&data]).unwrap();
-            all_tx.insert(format!("butch-1-{}", i), data.into());
+            all_tx.insert(format!("butch-1-{i}"), data.into());
         }
         let mut butch_clone = butch.clone();
         for i in 5..10 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.000Z", i * 2);
-            let data = butch.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {}", i)), None, None);
+            let data = butch.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {i}")), None, None);
             butch.push_tx(&id_lookup(&[&butch]), &[&data]).unwrap();
-            all_tx.insert(format!("butch-1-{}", i), data.into());
+            all_tx.insert(format!("butch-1-{i}"), data.into());
         }
         for i in 5..10 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.500Z", i * 2);
-            let data = butch_clone.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 2: {}", i)), None, None);
+            let data = butch_clone.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 2: {i}")), None, None);
             butch_clone.push_tx(&id_lookup(&[&butch]), &[&data]).unwrap();
-            all_tx.insert(format!("butch-2-{}", i), data.into());
+            all_tx.insert(format!("butch-2-{i}"), data.into());
         }
         for i in 0..10 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.000Z", (i * 2) + 1);
-            let data = dotty.tx_data(ts(&tx_ts), AppData::new(format!("data: dotty: {}", i)), None, None);
+            let data = dotty.tx_data(ts(&tx_ts), AppData::new(format!("data: dotty: {i}")), None, None);
             dotty.push_tx(&id_lookup(&[&dotty]), &[&data]).unwrap();
-            all_tx.insert(format!("dotty-1-{}", i), data.into());
+            all_tx.insert(format!("dotty-1-{i}"), data.into());
         }
 
         assert_eq!(
@@ -3468,7 +3453,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .all_transactions()
                 .iter()
-                .map(|t| format!("{}", t))
+                .map(|t| format!("{t}"))
                 .collect::<Vec<_>>(),
             vec![
                 "gen0",
@@ -3522,11 +3507,8 @@ pub(crate) mod tests {
             ) -> Result<Vec<(TopicTransaction, Option<AppData>)>> {
                 // first, process any incoming transactions
                 let mut incoming = Vec::new();
-                loop {
-                    match self.recv.try_recv() {
-                        Ok(tx) => incoming.push(tx),
-                        _ => break,
-                    }
+                while let Ok(tx) = self.recv.try_recv() {
+                    incoming.push(tx);
                 }
                 let tx_ref = incoming.iter().collect::<Vec<_>>();
 
@@ -3565,7 +3547,7 @@ pub(crate) mod tests {
                         tx.previous_transactions()
                             .unwrap()
                             .iter()
-                            .map(|p| String::from(&format!("{}", p)[0..8]))
+                            .map(|p| String::from(&format!("{p}")[0..8]))
                             .collect::<Vec<_>>()
                             .join(", "),
                         &tx_data.data,
@@ -3582,7 +3564,7 @@ pub(crate) mod tests {
                             .filter(|t| t.is_data_packet().unwrap())
                             .map(|t| t.id().clone())
                             .collect::<Vec<_>>();
-                        if tx_ids.len() > 0 {
+                        if !tx_ids.is_empty() {
                             tx_ids.sort_unstable();
                             let mut removals = Vec::with_capacity(5);
                             for _ in 0..(choice(rng, 3) + 1) {
@@ -3595,7 +3577,7 @@ pub(crate) mod tests {
                             Vec::new()
                         }
                     };
-                    if removals.len() > 0 {
+                    if !removals.is_empty() {
                         let tx_rm = TopicTransaction::new(self.peer().tx(
                             timestamp.clone(),
                             None,
@@ -3608,7 +3590,7 @@ pub(crate) mod tests {
                             &format!("{}", tx_rm.id())[0..8],
                             removals
                                 .iter()
-                                .map(|p| String::from(&format!("{}", p)[0..8]))
+                                .map(|p| String::from(&format!("{p}")[0..8]))
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
@@ -3634,12 +3616,12 @@ pub(crate) mod tests {
                             .map(|t| t.id().clone())
                             .collect::<Vec<_>>()
                     };
-                    if eligible.len() > 0 {
+                    if !eligible.is_empty() {
                         let tx_id = eligible[choice(rng, eligible.len())].clone();
                         let rm = self.peer().snapshot(&tx_id).unwrap();
                         info!(
                             "snapshot {} [{}] (rm [{}])",
-                            &format!("{}", tx_id)[0..8],
+                            &format!("{tx_id}")[0..8],
                             self.peer()
                                 .topic()
                                 .transactions()
@@ -3651,13 +3633,13 @@ pub(crate) mod tests {
                                 .map(|s| {
                                     s.all_transactions()
                                         .iter()
-                                        .map(|id| String::from(&format!("{}", id)[0..8]))
+                                        .map(|id| String::from(&format!("{id}")[0..8]))
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 })
                                 .unwrap_or(String::from("-")),
                             rm.iter()
-                                .map(|t| String::from(&format!("{}", t)[0..8]))
+                                .map(|t| String::from(&format!("{t}")[0..8]))
                                 .collect::<Vec<_>>()
                                 .join(", "),
                         );
@@ -3680,21 +3662,20 @@ pub(crate) mod tests {
                         let members = topic.state().members().values().cloned().collect::<Vec<_>>();
                         let device_key_map = members
                             .iter()
-                            .map(|member| {
+                            .flat_map(|member| {
                                 member.devices().iter().map(|device| {
                                     (
                                         device.id().clone(),
                                         keyserver
                                             .get(device.id())
                                             .expect("missing keyserver entry")
-                                            .get(0)
+                                            .first()
                                             .expect("empty keypackets")
                                             .entry()
                                             .pubkey(),
                                     )
                                 })
                             })
-                            .flatten()
                             .collect::<BTreeMap<_, _>>();
                         let device_map_ref = device_key_map.iter().map(|(d, p)| (d, *p)).collect::<BTreeMap<_, _>>();
                         (
@@ -3718,14 +3699,11 @@ pub(crate) mod tests {
 
         #[tracing::instrument(level = "warn")]
         fn run_topic(seed_val: usize) {
-            let seed = format!(
-                "eternal life offers nothing, instead shadowing a neverendingly affluent zombie infestation:{}",
-                seed_val
-            );
+            let seed = format!("eternal life offers nothing, instead shadowing a neverendingly affluent zombie infestation:{seed_val}");
             let mut rng_outer = rng::chacha20_seeded(Hash::new_blake3(seed.as_bytes()).unwrap().as_bytes().try_into().unwrap());
             let rng = &mut rng_outer;
             let mut setup_vals = [0u8; 3];
-            let peer_names = vec![
+            let peer_names = [
                 "butch", "dotty", "jerry", "frankie", "timmy", "wookie", "lucy", "sven", "nils", "wendall", "roxanne",
             ];
             rng.fill_bytes(&mut setup_vals);
@@ -3736,14 +3714,15 @@ pub(crate) mod tests {
 
             let topic_id = TopicID::new(rng);
 
+            #[allow(clippy::type_complexity)]
             let tx_ordered: Arc<Mutex<Vec<(TopicTransaction, Option<AppData>)>>> = Arc::new(Mutex::new(Vec::new()));
 
             assert!(peer_names.len() >= num_peers);
 
             let mut keyserver: HashMap<DeviceID, Vec<KeyPacket>> = HashMap::new();
             let mut peers = Vec::new();
-            for i in 0..num_peers {
-                let peer = PeerOuter::new(Peer::new_identity(rng, &topic_id, "PASSWORD1", peer_names[i]));
+            for peer_name in peer_names.iter().take(num_peers) {
+                let peer = PeerOuter::new(Peer::new_identity(rng, &topic_id, "PASSWORD1", peer_name));
                 keyserver.insert(peer.peer().device().id().clone(), peer.peer().key_packets().clone());
                 peers.push(peer);
             }
@@ -3751,7 +3730,7 @@ pub(crate) mod tests {
             let mut cur_ts: chrono::DateTime<chrono::Utc> = "1999-10-01T00:00:00Z".parse().unwrap();
             let mut ts_next = || {
                 cur_ts = cur_ts.add(std::time::Duration::from_secs(3600));
-                Timestamp::from(cur_ts.clone())
+                Timestamp::from(cur_ts)
             };
 
             let genesis = {
@@ -3844,10 +3823,7 @@ pub(crate) mod tests {
                 let has_been_unset = all_tx_clone
                     .iter()
                     .filter_map(|(t, _)| match t.get_packet() {
-                        Ok(packet) => match packet {
-                            Packet::DataUnset { transaction_ids } => Some(transaction_ids),
-                            _ => None,
-                        },
+                        Ok(Packet::DataUnset { transaction_ids }) => Some(transaction_ids),
                         _ => None,
                     })
                     .flatten()
@@ -3855,8 +3831,7 @@ pub(crate) mod tests {
                 let ordered_minus_removed = all_tx_clone
                     .iter()
                     .filter(|(tx, _)| !has_been_unset.contains(tx.id()))
-                    .filter(|e| e.1.is_some())
-                    .map(|e| e.1.clone().unwrap())
+                    .filter_map(|e| e.1.clone())
                     .collect::<Vec<_>>();
                 let data0 = topicdata!(peers[0].peer()).unwrap();
                 assert_eq!(final_data, ordered_minus_removed);
@@ -4228,7 +4203,7 @@ pub(crate) mod tests {
             let res = butch.push_tx(&id_lookup(&[&butch]), &[&rm]);
             match res {
                 Err(Error::TransactionUnsetNonDataPacket(txid)) => assert_eq!(txid, rm.id().clone()),
-                _ => panic!("unexpected result: {:?}", res),
+                _ => panic!("unexpected result: {res:?}"),
             }
         }
 
@@ -4244,7 +4219,7 @@ pub(crate) mod tests {
             let res = butch.push_tx(&id_lookup(&[&butch]), &[&rm]);
             match res {
                 Err(Error::TransactionUnsetNonDataPacket(txid)) => assert_eq!(txid, rm.id().clone()),
-                _ => panic!("unexpected result: {:?}", res),
+                _ => panic!("unexpected result: {res:?}"),
             }
         }
 
@@ -4260,7 +4235,7 @@ pub(crate) mod tests {
             let res = butch.push_tx(&id_lookup(&[&butch]), &[&rm]);
             match res {
                 Err(Error::TransactionUnsetNonDataPacket(txid)) => assert_eq!(txid, rm.id().clone()),
-                _ => panic!("unexpected result: {:?}", res),
+                _ => panic!("unexpected result: {res:?}"),
             }
         }
     }
@@ -4808,7 +4783,7 @@ pub(crate) mod tests {
                 assert_eq!(id1, tx_c.id());
                 assert_eq!(id2, tx_b.id());
             }
-            Err(e) => panic!("unexpected error: {:?}", e),
+            Err(e) => panic!("unexpected error: {e:?}"),
         }
 
         {

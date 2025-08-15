@@ -1,4 +1,4 @@
-.PHONY: all bench clean lint fmt release doc build run test test-panic test-st macros
+.PHONY: all bench clean lint lintfix fmt release doc build run test test-panic test-st macros
 
 # non-versioned include
 VARS ?= vars.mk
@@ -47,6 +47,9 @@ lint:
 		-A clippy::redundant_closure \
 		-A clippy::redundant_pattern_matching \
 		-A clippy::search_is_some
+
+lintfix: override CARGO_BUILD_ARGS += --fix
+lintfix: lint
 
 clean:
 	rm -rf target/

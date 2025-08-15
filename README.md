@@ -101,13 +101,13 @@ for a topic, a new secret is generated and securely shared with each current mem
 using one of two methods:
 
 1. Peers have a long-lived asymmetric keypair allowing secure sharing of secret data. This will generally live
-under the Stamp identity within the keychain under the name `/stamp/sync/v1/crypto`.
+   under the Stamp identity within the keychain under the name `/stamp/sync/v1/crypto`.
 1. Peers can (and should!) pre-generate and publish a set of "key packets" for each of their devices to a well-known
-location. Key packets contain a public asymmetric encryption key while the secret key is retained by the peer (and
-stored privately). Key packets are signed with the peer's signing key, which lives in their Stamp identity in the
-keychain under the name `/stamp/sync/v1/sign`. Key packets are meant to be single-use: once the sharing peer
-downloads a key packet, it should be removed from the location serving it. When a receiving peer receives a secret
-via a key in a key packet it should delete the private key associated with that packet.
+   location. Key packets contain a public asymmetric encryption key while the secret key is retained by the peer (and
+   stored privately). Key packets are signed with the peer's signing key, which lives in their Stamp identity in the
+   keychain under the name `/stamp/sync/v1/sign`. Key packets are meant to be single-use: once the sharing peer
+   downloads a key packet, it should be removed from the location serving it. When a receiving peer receives a secret
+   via a key in a key packet it should delete the private key associated with that packet.
 
 Key packets should be the preferred method of sharing secrets between peers. They reduce the damage done by a
 compromised long-lived encryption key. Long-lived encryption keys can be used in the absence of key packets.
