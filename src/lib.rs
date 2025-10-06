@@ -9,12 +9,12 @@ use stamp_core::{
         rng::{CryptoRng, RngCore},
         CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature,
     },
-    dag::{Dag, DagNode, Transaction, TransactionBody, TransactionID, Transactions},
+    dag::{Dag, DagNode, ExtTransaction, Transaction, TransactionBody, TransactionID, Transactions},
     identity::IdentityID,
     util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 
 /// Defines a permission a member can have within a group.
 #[derive(Clone, Debug, PartialEq, AsnType, Encode, Decode)]
@@ -37,6 +37,78 @@ pub enum Permission {
     #[rasn(tag(explicit(4)))]
     TopicRekey,
 }
+
+/// Represents a saved key packet as an `ExtV1` transaction
+#[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
+#[rasn(delegate)]
+pub struct KeyPacket(ExtTransaction);
+
+impl KeyPacket {
+    /// Create a new `KeyPacket`
+    pub fn new<T: Into<Timestamp> + Clone>(
+        identity: &Transactions,
+        hash_with: &HashAlgo,
+        now: T,
+        device_id: &DeviceID,
+        pubkey: &CryptoKeypairPublic,
+    ) -> Result<Self> {
+        let device_bytes = device_id.serialize_binary().unwrap();
+        let pubkey_bytes = pubkey.serialize_binary().unwrap();
+        let ext = ExtTransaction::try_from(
+            identity
+                .ext(
+                    hash_with,
+                    now,
+                    Vec::new(),
+                    Some(BinaryVec::from(Vec::from(b"/stamp/sync/v1/keypacket"))),
+                    Some([(b"device_id".as_slice(), device_bytes.as_slice())]),
+                    BinaryVec::from(pubkey_bytes),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        Ok(Self(ext))
+    }
+
+    /// Get this packet's `device_id` if possible (ie, if the underlying transaction is properly
+    /// formed LOL ahaha XD XD)
+    pub fn get_device_id(&self) -> Result<DeviceID> {
+        let context = self.get_context()?.as_ref().ok_or_else(|| Error::KeyPacketMalformed)?;
+        let device_id_bin = context
+            .get(&BinaryVec::from(Vec::from(b"device_id")))
+            .ok_or_else(|| Error::KeyPacketMalformed)?;
+        let device_id = DeviceID::deserialize_binary(&device_id_bin)?;
+        Ok(device_id)
+    }
+
+    /// Get this packet's pubkey
+    pub fn get_pubkey(&self) -> Result<CryptoKeypairPublic> {
+        let payload = self.get_payload()?;
+        let pubkey = CryptoKeypairPublic::deserialize_binary(&payload)?;
+        Ok(pubkey)
+    }
+}
+
+impl From<ExtTransaction> for KeyPacket {
+    fn from(val: ExtTransaction) -> Self {
+        Self(val)
+    }
+}
+
+impl Deref for KeyPacket {
+    type Target = ExtTransaction;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for KeyPacket {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl SerdeBinary for KeyPacket {}
 
 /// Represents a unique ID for a member device. Randomly generated, probably.
 #[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -155,80 +227,6 @@ impl SecretEntry {
 
 impl SerdeBinary for SecretEntry {}
 
-/// Holds information about a public cryptographic encryption key.
-#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
-#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct KeyPacketEntry {
-    /// The identity id that owns the included public key
-    #[rasn(tag(explicit(0)))]
-    identity_id: IdentityID,
-    /// The device this key packet was generated from/for.
-    #[rasn(tag(explicit(1)))]
-    device_id: DeviceID,
-    /// The cryptographic public key we're advertising others to use to send us messages.
-    #[rasn(tag(explicit(1)))]
-    pubkey: CryptoKeypairPublic,
-}
-
-impl SerdeBinary for KeyPacketEntry {}
-
-/// Describes a cryptographic encryption public key, signed with a well-known identity (sync) key.
-/// This allows a (potential) member to publish a number of random pre-generated cryptographic keys
-/// that others can verify that they own, enabling participants to avoid using the long-lived sync
-/// crypto key (if possible).
-#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
-#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct KeyPacket {
-    /// The cryptographic hash of the serialized `entry`.
-    #[rasn(tag(explicit(0)))]
-    id: Hash,
-    /// Holds the actual key packet data (basically a crypto public key)
-    #[rasn(tag(explicit(1)))]
-    entry: KeyPacketEntry,
-    /// A signature on the `id` field (the hash of the entry), signed by a well-known sync signing
-    /// key.
-    #[rasn(tag(explicit(2)))]
-    signature: SignKeypairSignature,
-}
-
-impl KeyPacket {
-    /// Create a new key packet, advertising a public crypto key we own that's signed with our
-    /// signing keypair (so others can verify it is actually owned by us).
-    pub fn new(
-        master_key: &SecretKey,
-        sign_keypair: &SignKeypair,
-        identity_id: IdentityID,
-        device_id: DeviceID,
-        pubkey: CryptoKeypairPublic,
-    ) -> Result<Self> {
-        let entry = KeyPacketEntry {
-            identity_id,
-            device_id,
-            pubkey,
-        };
-        let entry_ser = entry.serialize_binary()?;
-        let id = Hash::new_blake3(&entry_ser[..])?;
-        let id_ser = id.serialize_binary()?;
-        let signature = sign_keypair.sign(master_key, &id_ser[..])?;
-        Ok(Self { id, entry, signature })
-    }
-
-    /// Verify a key packet comes from the key we think it does, returning the crypto pubkey if so.
-    pub fn verify(&self, sign_pubkey: &SignKeypairPublic) -> Result<&CryptoKeypairPublic> {
-        let entry_ser = self.entry().serialize_binary()?;
-        let our_hash = Hash::new_blake3(&entry_ser[..])?;
-        if &our_hash != self.id() {
-            Err(Error::KeyPacketTampered)?;
-        }
-
-        let hash_ser = self.id().serialize_binary()?;
-        sign_pubkey.verify(self.signature(), &hash_ser[..])?;
-        Ok(self.entry().pubkey())
-    }
-}
-
-impl SerdeBinary for KeyPacket {}
-
 /// A message sent to a member containing a topic secret.
 #[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
@@ -272,7 +270,7 @@ impl MemberRekey {
     pub fn seal<R: RngCore + CryptoRng>(
         rng: &mut R,
         member: Member,
-        device_key_map: &BTreeMap<&DeviceID, &CryptoKeypairPublic>,
+        device_key_map: &BTreeMap<DeviceID, CryptoKeypairPublic>,
         secrets: Vec<SecretEntry>,
     ) -> Result<Self> {
         let secret_ser = secrets.serialize_binary()?;
@@ -549,7 +547,7 @@ impl Snapshot {
 pub struct TopicTransaction {
     /// The transaction we're wrapping
     #[rasn(tag(explicit(0)))]
-    transaction: Transaction,
+    transaction: ExtTransaction,
     /// A snapshot. This rolls up all previous transactions, *including this one* into a single
     /// state.
     ///
@@ -572,45 +570,50 @@ impl TopicTransaction {
     }
 
     /// Create a new topic transaction.
-    pub fn new(transaction: Transaction) -> Self {
+    pub fn new(transaction: ExtTransaction) -> Self {
         Self {
             transaction,
             snapshot: None,
         }
     }
 
-    /// Return's this transaction's packet data.
+    /// Return this transaction's topic id
+    pub fn get_topic_id(&self) -> Result<TopicID> {
+        if self.is_empty() {
+            Err(Error::TransactionIsEmpty(self.id().clone()))?;
+        }
+        let context = self.transaction().get_context()?;
+        let key = BinaryVec::from(Vec::from(b"topic_id"));
+        let topic_id_bin = context
+            .as_ref()
+            .ok_or_else(|| Error::TransactionMissingTopicID(self.id().clone()))?
+            .get(&key)
+            .ok_or_else(|| Error::TransactionMissingTopicID(self.id().clone()))?;
+        let topic_id = TopicID::deserialize_binary(topic_id_bin.deref().as_slice())?;
+        Ok(topic_id)
+    }
+
+    /// Returns this transaction's packet data.
     pub fn get_packet(&self) -> Result<Packet> {
         if self.is_empty() {
             Err(Error::TransactionIsEmpty(self.id().clone()))?;
         }
-        match self.transaction().entry().body() {
-            TransactionBody::ExtV1 { ref payload, .. } => {
-                let packet = Packet::deserialize_binary(payload.deref())?;
-                Ok(packet)
-            }
-            _ => Err(Error::PacketInvalid(self.id().clone()))?,
-        }
+        let payload = self.transaction().get_payload()?;
+        let packet = Packet::deserialize_binary(payload.deref())?;
+        Ok(packet)
     }
 
     /// Returns the identity id of this transaction.
     pub fn identity_id(&self) -> Result<&IdentityID> {
-        match self.transaction().entry().body() {
-            TransactionBody::ExtV1 { ref creator, .. } => Ok(creator),
-            _ => Err(Error::PacketInvalid(self.id().clone()))?,
-        }
+        Ok(self.transaction().get_creator()?)
     }
 
     /// Return the transactions that came before this one within the topic DAG. In other words, we
     /// don't use `transaction.entry().previous_transactions()` but rather
     /// `transaction.entry().body::<ExtV1>().previous_transactions()`.
     pub fn previous_transactions(&self) -> Result<Vec<&TransactionID>> {
-        match self.transaction().entry().body() {
-            TransactionBody::ExtV1 {
-                ref previous_transactions, ..
-            } => Ok(previous_transactions.iter().collect::<Vec<_>>()),
-            _ => Err(Error::PacketInvalid(self.id().clone()))?,
-        }
+        let prev = self.transaction().get_previous_transactions()?;
+        Ok(prev.iter().collect::<Vec<_>>())
     }
 
     /// Returns whether or not this transaction houses a control packet.
@@ -628,13 +631,8 @@ impl TopicTransaction {
         if self.is_empty() {
             Err(Error::TransactionIsEmpty(self.id().clone()))?;
         }
-        match self.transaction().entry().body() {
-            TransactionBody::ExtV1 { payload, .. } => {
-                let packet = Packet::deserialize_binary(payload.as_slice())?;
-                Ok(matches!(packet, Packet::DataUnset { .. }))
-            }
-            _ => Err(Error::PacketInvalid(self.id().clone()))?,
-        }
+        let packet = self.get_packet()?;
+        Ok(matches!(packet, Packet::DataUnset { .. }))
     }
 
     /// Returns the `TransactionID`s being unset IF this is an unset
@@ -642,15 +640,10 @@ impl TopicTransaction {
         if self.is_empty() {
             Err(Error::TransactionIsEmpty(self.id().clone()))?;
         }
-        match self.transaction().entry().body() {
-            TransactionBody::ExtV1 { payload, .. } => {
-                let packet = Packet::deserialize_binary(payload.as_slice())?;
-                match packet {
-                    Packet::DataUnset { transaction_ids } => Ok(transaction_ids.clone()),
-                    _ => Ok(Vec::new()),
-                }
-            }
-            _ => Err(Error::PacketInvalid(self.id().clone()))?,
+        let packet = self.get_packet()?;
+        match packet {
+            Packet::DataUnset { transaction_ids } => Ok(transaction_ids.clone()),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -675,8 +668,8 @@ impl TopicTransaction {
     }
 }
 
-impl From<Transaction> for TopicTransaction {
-    fn from(t: Transaction) -> Self {
+impl From<ExtTransaction> for TopicTransaction {
+    fn from(t: ExtTransaction) -> Self {
         Self::new(t)
     }
 }
@@ -1033,7 +1026,7 @@ impl Topic {
         &self,
         rng: &mut R,
         members: Vec<Member>,
-        device_key_map: &BTreeMap<&DeviceID, &CryptoKeypairPublic>,
+        device_key_map: &BTreeMap<DeviceID, CryptoKeypairPublic>,
     ) -> Result<Packet> {
         let mut secrets = self.secrets().clone();
         secrets.push(SecretEntry::new_current_transaction(TopicSecret::new(rng)));
@@ -1279,14 +1272,19 @@ impl Topic {
     }
 
     /// Create a Stamp transaction from a packet.
-    pub fn transaction_from_packet<T: Into<Timestamp> + Clone>(
+    pub fn transaction_from_packet<T, K>(
         &self,
         transactions: &Transactions,
         hash_with: &HashAlgo,
         previous_transactions: Option<Vec<TransactionID>>,
+        context: Option<K>,
         now: T,
         packet: &Packet,
-    ) -> Result<Transaction> {
+    ) -> Result<Transaction>
+    where
+        T: Into<Timestamp> + Clone,
+        K: Into<HashMapAsn1<BinaryVec, BinaryVec>>,
+    {
         let packet_ser = packet.serialize_binary()?;
         let prev = match previous_transactions {
             Some(prev) => prev,
@@ -1294,14 +1292,12 @@ impl Topic {
         };
         let ty = Vec::from(b"/stamp/sync/v1/packet");
         let topic_id_ser = self.id().serialize_binary()?;
-        let trans = transactions.ext(
-            hash_with,
-            now,
-            prev,
-            Some(ty.into()),
-            Some([(b"topic_id".as_slice(), &topic_id_ser[..])]),
-            packet_ser.into(),
-        )?;
+        let context = context.map(|context| {
+            let mut ctx: HashMapAsn1<BinaryVec, BinaryVec> = context.into();
+            ctx.insert(Vec::from(b"topic_id".as_slice()).into(), topic_id_ser.into());
+            ctx
+        });
+        let trans = transactions.ext(hash_with, now, prev, Some(ty.into()), context, packet_ser.into())?;
         Ok(trans)
     }
 
@@ -1507,7 +1503,7 @@ impl Topic {
                     },
                 );
                 let topic_trans = TopicTransaction {
-                    transaction: trans,
+                    transaction: trans.try_into()?,
                     snapshot: None,
                 };
                 recreated.insert(tx_id.clone());
@@ -1893,7 +1889,7 @@ pub(crate) mod tests {
         let name_map = tx.iter().map(|(name, tx)| (tx.id().clone(), name)).collect::<HashMap<_, _>>();
         for (name, trans) in tx {
             #[allow(suspicious_double_ref_op)]
-            let tt = TopicTransaction::new(trans.clone().clone());
+            let tt = TopicTransaction::new(trans.clone().clone().try_into().unwrap());
             let next = tt
                 .previous_transactions()
                 .expect("previous_transactions()")
@@ -2247,13 +2243,7 @@ pub(crate) mod tests {
         fn generate_key_packets(&mut self, num_keys: usize) {
             let master_key = self.master_key().clone();
             let identity = self.identity().build_identity().unwrap();
-            let sign_key = identity
-                .keychain()
-                .subkey_by_name("/stamp/sync/v1/sign")
-                .unwrap()
-                .key()
-                .as_signkey()
-                .unwrap();
+            let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap().key();
 
             let mut crypto_keys = (0..num_keys)
                 .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(self.rng_mut(), &master_key).unwrap())
@@ -2261,8 +2251,16 @@ pub(crate) mod tests {
             let mut key_packets = crypto_keys
                 .iter()
                 .map(|k| {
-                    KeyPacket::new(self.master_key(), sign_key, identity.id().clone(), self.device().id().clone(), k.clone().into())
-                        .unwrap()
+                    let mut packet = KeyPacket::new(
+                        self.identity(),
+                        &HashAlgo::Blake3,
+                        ts("2005-07-26T21:00:00-0700"),
+                        self.device().id(),
+                        &CryptoKeypairPublic::from(k.clone()),
+                    )
+                    .unwrap();
+                    packet.sign_mut(&master_key, &admin_key).unwrap();
+                    packet
                 })
                 .collect::<Vec<_>>();
             self.crypto_keys_mut().append(&mut crypto_keys);
@@ -2274,7 +2272,7 @@ pub(crate) mod tests {
             let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap();
             let transaction = self
                 .topic()
-                .transaction_from_packet(self.identity(), &HashAlgo::Blake3, prev, now, &packet)
+                .transaction_from_packet(self.identity(), &HashAlgo::Blake3, prev, None::<[(&[u8], &[u8]); 0]>, now, &packet)
                 .unwrap();
             transaction.sign(self.master_key(), admin_key).unwrap()
         }
@@ -2400,7 +2398,7 @@ pub(crate) mod tests {
         let transactions = transactions
             .into_iter()
             .map(|t| t.sign(master_key, admin_key).unwrap())
-            .map(|t| TopicTransaction::new(t))
+            .map(|t| TopicTransaction::new(t.try_into().unwrap()))
             .collect::<Vec<_>>();
         let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
         Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[crypto_key], &identity_id, device_id)
@@ -2421,10 +2419,10 @@ pub(crate) mod tests {
     }
 
     // creates a device_id -> crypto pubkey mapping
-    fn device_lookup<'a>(packets: &[&'a KeyPacket]) -> BTreeMap<&'a DeviceID, &'a CryptoKeypairPublic> {
+    fn device_lookup(packets: &[&KeyPacket]) -> BTreeMap<DeviceID, CryptoKeypairPublic> {
         packets
             .iter()
-            .map(|p| (p.entry().device_id(), p.entry().pubkey()))
+            .map(|p| (p.get_device_id().unwrap(), p.get_pubkey().unwrap()))
             .collect::<BTreeMap<_, _>>()
     }
 
@@ -2449,9 +2447,9 @@ pub(crate) mod tests {
     macro_rules! rekey_args {
         ($member_def:expr) => {{
             let member_defs = $member_def;
-            let key_lookup: BTreeMap<&DeviceID, &CryptoKeypairPublic> = member_defs
+            let key_lookup: BTreeMap<DeviceID, CryptoKeypairPublic> = member_defs
                 .iter()
-                .map(|(_, lookup)| lookup.into_iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>())
+                .map(|(_, lookup)| lookup.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())
                 .flatten()
                 .collect();
             let members = member_defs.into_iter().map(|(m, _)| m).collect::<Vec<_>>();
@@ -2502,7 +2500,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id().clone(), node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -2526,11 +2524,18 @@ pub(crate) mod tests {
             ],
         };
 
+        assert_eq!(
+            TopicTransaction::new(topic_tx[0].clone().try_into().unwrap())
+                .get_topic_id()
+                .unwrap(),
+            topic_id
+        );
+
         let push = |topic: &mut Topic, tx: Vec<Transaction>| {
             let txt = tx
                 .into_iter()
                 .map(|t| t.sign(&master_key, &admin_key).unwrap())
-                .map(|t| TopicTransaction::new(t))
+                .map(|t| TopicTransaction::new(t.try_into().unwrap()))
                 .collect::<Vec<_>>();
             let identity_id = transactions.identity_id().unwrap();
             let identity_map = HashMap::from([(identity_id.clone(), &transactions)]);
@@ -2557,33 +2562,23 @@ pub(crate) mod tests {
     #[test]
     fn key_packet_new_verify() {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
-        let (master_key, transactions, _admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
-        let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
+        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
         let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
 
         let device = Device::new(&mut rng, "laptop".into());
-        let packet = KeyPacket::new(
-            &master_key,
-            &node_a_sync_sig,
-            transactions.identity_id().unwrap(),
-            device.id().clone(),
-            node_a_sync_crypto.clone().into(),
+        let mut packet = KeyPacket::new(
+            &transactions,
+            &HashAlgo::Blake3,
+            ts("2005-07-26T21:00:00-0700"),
+            device.id(),
+            &node_a_sync_crypto.clone().into(),
         )
         .unwrap();
+        packet.sign_mut(&master_key, admin_key.key()).unwrap();
 
-        packet.verify(&node_a_sync_sig.clone().into()).unwrap();
-        assert_eq!(packet.entry().pubkey(), &node_a_sync_crypto.clone().into());
-
-        {
-            let mut packet = packet.clone();
-            let fake_identity_id = IdentityID::from(TransactionID::from(Hash::new_blake3(b"zing").unwrap()));
-            packet.entry_mut().set_identity_id(fake_identity_id.clone());
-            let res = packet.verify(&node_a_sync_sig.clone().into());
-            match res {
-                Err(Error::KeyPacketTampered) => {}
-                _ => panic!("unexpected: {res:?}"),
-            }
-        }
+        let identity = transactions.build_identity().unwrap();
+        packet.verify(Some(&identity)).unwrap();
+        assert_eq!(packet.get_pubkey().unwrap(), node_a_sync_crypto.clone().into());
     }
 
     #[test]
@@ -2613,7 +2608,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id().clone(), node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -2706,10 +2701,10 @@ pub(crate) mod tests {
         let mut jerry_laptop = Peer::new_identity(&mut rng, &topic_id, "jerjer1", "laptop");
         let mut frankie_phone = Peer::new_identity(&mut rng, &topic_id, "frankiehankie", "phone");
 
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch_laptop, admin_perms(), 0),]);
             let packet = butch_laptop.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
 
         assert_eq!(butch_laptop.topic().secrets().len(), 0);
@@ -2748,7 +2743,10 @@ pub(crate) mod tests {
         assert_eq!(txids!(&jerry_laptop), empty_tx);
         assert_eq!(txids!(&frankie_phone), empty_tx);
 
-        let data1 = butch_laptop.tx_data(ts("2024-12-08T01:00:01Z"), AppData::new("hi i'm butch"), None, None);
+        let data1 = butch_laptop
+            .tx_data(ts("2024-12-08T01:00:01Z"), AppData::new("hi i'm butch"), None, None)
+            .try_into()
+            .unwrap();
         butch_laptop.push_tx(&id_lookup(&[&butch_laptop]), &[&data1]).unwrap();
         assert_eq!(butch_laptop.topic().secrets().len(), 1);
 
@@ -2758,7 +2756,7 @@ pub(crate) mod tests {
                 rkmember!(&dotty_laptop, admin_perms(), 0),
             ]);
             let packet = butch_laptop.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch_laptop.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
 
         assert_eq!(butch_laptop.topic().secrets().len(), 1);
@@ -2830,7 +2828,10 @@ pub(crate) mod tests {
 
         // this timestamp is before data1, but should be ordered AFTER because Dotty has data1
         // already and is going to set it as the prev to data2.
-        let data2 = dotty_laptop.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("dotty is best"), None, None);
+        let data2: ExtTransaction = dotty_laptop
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("dotty is best"), None, None)
+            .try_into()
+            .unwrap();
         dotty_laptop
             .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data2])
             .unwrap();
@@ -2846,7 +2847,10 @@ pub(crate) mod tests {
         assert_eq!(topicdata!(jerry_laptop).unwrap(), vec![]);
         assert_eq!(topicdata!(frankie_phone).unwrap(), vec![]);
 
-        let data3 = dotty_laptop.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("it is plain to see"), None, None);
+        let data3: ExtTransaction = dotty_laptop
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("it is plain to see"), None, None)
+            .try_into()
+            .unwrap();
         dotty_laptop
             .push_tx(&id_lookup(&[&butch_laptop, &dotty_laptop]), &[&data3])
             .unwrap();
@@ -2912,7 +2916,7 @@ pub(crate) mod tests {
                 rkmember!(&frankie_phone, vec![Permission::DataSet, Permission::DataUnset], 0),
             ]);
             let packet = butch_laptop.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch_laptop.tx(ts("2024-12-09T00:00:00Z"), None, packet)
+            butch_laptop.tx(ts("2024-12-09T00:00:00Z"), None, packet).try_into().unwrap()
         };
 
         {
@@ -3022,26 +3026,35 @@ pub(crate) mod tests {
         // this transaction will not be merged by the others until they've all seen the new data.
         // the goal of this is to test if the jerry/frankie data transactions remain valid even
         // after becoming aware of dotty's skylarkings.
-        let perms1 = dotty_laptop.tx(
-            ts("2024-12-09T18:00:00Z"),
-            None,
-            Packet::MemberPermissionsChange {
-                identity_id: jerry_laptop.identity().identity_id().unwrap(),
-                permissions: vec![],
-            },
-        );
+        let perms1: ExtTransaction = dotty_laptop
+            .tx(
+                ts("2024-12-09T18:00:00Z"),
+                None,
+                Packet::MemberPermissionsChange {
+                    identity_id: jerry_laptop.identity().identity_id().unwrap(),
+                    permissions: vec![],
+                },
+            )
+            .try_into()
+            .unwrap();
         dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[&perms1]).unwrap();
-        let perms2 = dotty_laptop.tx(
-            ts("2024-12-09T18:00:01Z"),
-            None,
-            Packet::MemberPermissionsChange {
-                identity_id: frankie_phone.identity().identity_id().unwrap(),
-                permissions: vec![],
-            },
-        );
+        let perms2: ExtTransaction = dotty_laptop
+            .tx(
+                ts("2024-12-09T18:00:01Z"),
+                None,
+                Packet::MemberPermissionsChange {
+                    identity_id: frankie_phone.identity().identity_id().unwrap(),
+                    permissions: vec![],
+                },
+            )
+            .try_into()
+            .unwrap();
         dotty_laptop.push_tx(&id_lookup(&[&dotty_laptop]), &[&perms2]).unwrap();
 
-        let data4 = jerry_laptop.tx_data(ts("2024-12-10T00:00:00Z"), AppData::new("jerry reporting in"), None, None);
+        let data4: ExtTransaction = jerry_laptop
+            .tx_data(ts("2024-12-10T00:00:00Z"), AppData::new("jerry reporting in"), None, None)
+            .try_into()
+            .unwrap();
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
             assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
@@ -3049,7 +3062,10 @@ pub(crate) mod tests {
             assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
             assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data4]).unwrap(), TopicDagModificationResult::DagUpdated);
         }
-        let data5 = jerry_laptop.tx_data(ts("2024-12-10T00:01:00Z"), AppData::new("just saw a cat"), None, None);
+        let data5: ExtTransaction = jerry_laptop
+            .tx_data(ts("2024-12-10T00:01:00Z"), AppData::new("just saw a cat"), None, None)
+            .try_into()
+            .unwrap();
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
             assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
@@ -3057,7 +3073,10 @@ pub(crate) mod tests {
             assert_eq!(jerry_laptop.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
             assert_eq!(frankie_phone.push_tx(&all_ids_lookup, &[&data5]).unwrap(), TopicDagModificationResult::DagUpdated);
         }
-        let data6 = frankie_phone.tx_data(ts("2024-12-10T00:02:00Z"), AppData::new("i hate cats"), None, None);
+        let data6: ExtTransaction = frankie_phone
+            .tx_data(ts("2024-12-10T00:02:00Z"), AppData::new("i hate cats"), None, None)
+            .try_into()
+            .unwrap();
         {
             let all_ids_lookup = id_lookup(&[&butch_laptop, &butch_phone, &dotty_laptop, &jerry_laptop, &frankie_phone]);
             assert_eq!(butch_laptop.push_tx(&all_ids_lookup, &[&data6]).unwrap(), TopicDagModificationResult::DagUpdated);
@@ -3147,49 +3166,67 @@ pub(crate) mod tests {
 
     #[test]
     fn topic_dag_rebuild_with_snapshot() {
-        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe.").unwrap().as_bytes().try_into().unwrap());
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe...?").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "butch6969", "laptop");
         let genesis = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0)]);
             let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         dotty.push_tx(&id_lookup(&[&dotty]), &[&genesis]).unwrap();
 
         let rekey1 = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)]);
             let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet)
+            dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet).try_into().unwrap()
         };
 
         dotty.push_tx(&id_lookup(&[&dotty, &butch]), &[&rekey1]).unwrap();
         butch.push_tx(&id_lookup(&[&dotty, &butch]), &[&rekey1, &genesis]).unwrap();
 
-        let data1 = butch.tx_data(ts("2024-12-10T01:00:00Z"), AppData::new("hi i'm butch"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2024-12-10T01:00:00Z"), AppData::new("hi i'm butch"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
-        let data2 = dotty.tx_data(ts("2024-12-10T02:00:00Z"), AppData::new("haiii!"), None, None);
+        let data2: ExtTransaction = dotty
+            .tx_data(ts("2024-12-10T02:00:00Z"), AppData::new("haiii!"), None, None)
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&data2]).unwrap();
         butch.push_tx(&id_lookup(&[&dotty]), &[&data2]).unwrap();
 
-        let rm1 = dotty.tx(
-            ts("2024-12-10T02:30:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![data2.id().clone()],
-            },
-        );
+        let rm1: ExtTransaction = dotty
+            .tx(
+                ts("2024-12-10T02:30:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![data2.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&rm1]).unwrap();
         butch.push_tx(&id_lookup(&[&dotty]), &[&rm1]).unwrap();
 
-        let data3 = dotty.tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("nice knowing you"), None, None);
-        let data4 = butch.tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("oh, what's this????"), None, None);
+        let data3: ExtTransaction = dotty
+            .tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("nice knowing you"), None, None)
+            .try_into()
+            .unwrap();
+        let data4: ExtTransaction = butch
+            .tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("oh, what's this????"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch, &dotty]), &[&data3, &data4]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch, &dotty]), &[&data3, &data4]).unwrap();
 
-        let data5 = butch.tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("i'm not to be disturbed."), None, None);
+        let data5: ExtTransaction = butch
+            .tx_data(ts("2024-12-10T03:00:00Z"), AppData::new("i'm not to be disturbed."), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch, &dotty]), &[&data5]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch, &dotty]), &[&data5]).unwrap();
 
@@ -3218,7 +3255,10 @@ pub(crate) mod tests {
         // snapshot should kick out our remover and removee transactions
         assert_eq!(dotty.topic().transactions().len(), 6);
 
-        let data6 = dotty.tx_data(ts("2024-12-11T00:00:00Z"), AppData::new("wise and shine"), None, None);
+        let data6: ExtTransaction = dotty
+            .tx_data(ts("2024-12-11T00:00:00Z"), AppData::new("wise and shine"), None, None)
+            .try_into()
+            .unwrap();
 
         // data6's prev should ONLY be data5
         assert_eq!(TopicTransaction::new(data6.clone()).previous_transactions().unwrap(), vec![data5.id()]);
@@ -3258,7 +3298,10 @@ pub(crate) mod tests {
         );
 
         // and push another tx
-        let data7 = dotty.tx_data(ts("2024-12-12T00:00:00Z"), AppData::new("this way, please"), None, None);
+        let data7: ExtTransaction = dotty
+            .tx_data(ts("2024-12-12T00:00:00Z"), AppData::new("this way, please"), None, None)
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&data7]).unwrap();
 
         assert_eq!(
@@ -3280,16 +3323,16 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "butch6969", "laptop");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0)]);
             let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            dotty.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         dotty.push_tx(&id_lookup(&[&dotty]), &[&genesis]).unwrap();
-        let rekey1 = {
+        let rekey1: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&dotty, admin_perms(), 0), rkmember!(&butch, admin_perms(), 0)]);
             let packet = dotty.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet)
+            dotty.tx(ts("2024-12-09T01:00:00Z"), None, packet).try_into().unwrap()
         };
         dotty.push_tx(&id_lookup(&[&dotty]), &[&rekey1]).unwrap();
         butch.push_tx(&id_lookup(&[&dotty]), &[&rekey1, &genesis]).unwrap();
@@ -3299,26 +3342,38 @@ pub(crate) mod tests {
         all_tx.insert("rek1".to_string(), rekey1.into());
         for i in 0..5 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.000Z", i * 2);
-            let data = butch.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {i}")), None, None);
+            let data: ExtTransaction = butch
+                .tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {i}")), None, None)
+                .try_into()
+                .unwrap();
             butch.push_tx(&id_lookup(&[&butch]), &[&data]).unwrap();
             all_tx.insert(format!("butch-1-{i}"), data.into());
         }
         let mut butch_clone = butch.clone();
         for i in 5..10 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.000Z", i * 2);
-            let data = butch.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {i}")), None, None);
+            let data: ExtTransaction = butch
+                .tx_data(ts(&tx_ts), AppData::new(format!("data: butch 1: {i}")), None, None)
+                .try_into()
+                .unwrap();
             butch.push_tx(&id_lookup(&[&butch]), &[&data]).unwrap();
             all_tx.insert(format!("butch-1-{i}"), data.into());
         }
         for i in 5..10 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.500Z", i * 2);
-            let data = butch_clone.tx_data(ts(&tx_ts), AppData::new(format!("data: butch 2: {i}")), None, None);
+            let data: ExtTransaction = butch_clone
+                .tx_data(ts(&tx_ts), AppData::new(format!("data: butch 2: {i}")), None, None)
+                .try_into()
+                .unwrap();
             butch_clone.push_tx(&id_lookup(&[&butch]), &[&data]).unwrap();
             all_tx.insert(format!("butch-2-{i}"), data.into());
         }
         for i in 0..10 {
             let tx_ts = format!("2024-12-10T01:00:{:0>2}.000Z", (i * 2) + 1);
-            let data = dotty.tx_data(ts(&tx_ts), AppData::new(format!("data: dotty: {i}")), None, None);
+            let data: ExtTransaction = dotty
+                .tx_data(ts(&tx_ts), AppData::new(format!("data: dotty: {i}")), None, None)
+                .try_into()
+                .unwrap();
             dotty.push_tx(&id_lookup(&[&dotty]), &[&data]).unwrap();
             all_tx.insert(format!("dotty-1-{i}"), data.into());
         }
@@ -3540,7 +3595,12 @@ pub(crate) mod tests {
                 // add a new transaction?
                 if probability(rng, 0.5) {
                     let tx_data = AppData::new(format!("{} -- {}", self.peer().device().name(), iter));
-                    let tx = TopicTransaction::new(self.peer_mut().tx_data(timestamp.clone(), tx_data.clone(), None, None));
+                    let tx = TopicTransaction::new(
+                        self.peer_mut()
+                            .tx_data(timestamp.clone(), tx_data.clone(), None, None)
+                            .try_into()
+                            .unwrap(),
+                    );
                     info!(
                         "new tx {} [{}] :: \"{}\"",
                         &format!("{}", tx.id())[0..8],
@@ -3578,13 +3638,18 @@ pub(crate) mod tests {
                         }
                     };
                     if !removals.is_empty() {
-                        let tx_rm = TopicTransaction::new(self.peer().tx(
-                            timestamp.clone(),
-                            None,
-                            Packet::DataUnset {
-                                transaction_ids: removals.clone(),
-                            },
-                        ));
+                        let tx_rm = TopicTransaction::new(
+                            self.peer()
+                                .tx(
+                                    timestamp.clone(),
+                                    None,
+                                    Packet::DataUnset {
+                                        transaction_ids: removals.clone(),
+                                    },
+                                )
+                                .try_into()
+                                .unwrap(),
+                        );
                         info!(
                             "rm {} [{}]",
                             &format!("{}", tx_rm.id())[0..8],
@@ -3671,19 +3736,22 @@ pub(crate) mod tests {
                                             .expect("missing keyserver entry")
                                             .first()
                                             .expect("empty keypackets")
-                                            .entry()
-                                            .pubkey(),
+                                            .get_pubkey()
+                                            .unwrap(),
                                     )
                                 })
                             })
                             .collect::<BTreeMap<_, _>>();
-                        let device_map_ref = device_key_map.iter().map(|(d, p)| (d, *p)).collect::<BTreeMap<_, _>>();
+                        let device_map_ref = device_key_map
+                            .iter()
+                            .map(|(d, p)| (d.clone(), p.clone()))
+                            .collect::<BTreeMap<_, _>>();
                         (
                             self.peer().topic().rekey(rng, members, &device_map_ref)?,
                             device_key_map.keys().cloned().collect::<Vec<_>>(),
                         )
                     };
-                    let tx_rekey = TopicTransaction::new(self.peer().tx(timestamp.clone(), None, packet));
+                    let tx_rekey = TopicTransaction::new(self.peer().tx(timestamp.clone(), None, packet).try_into().unwrap());
                     self.peer().push_tx(lookup, &[&tx_rekey])?;
                     tx_return.push((tx_rekey, None));
                     for device_id in device_list {
@@ -3745,7 +3813,7 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>();
                 let (members, key_lookup) = rekey_args!(rekey_entries.iter().map(|(x, y)| (x.clone(), y)).collect::<Vec<_>>());
                 let packet = peers[0].peer().topic().rekey(rng, members, &key_lookup).unwrap();
-                TopicTransaction::new(peers[0].peer().tx(ts_next(), None, packet))
+                TopicTransaction::new(peers[0].peer().tx(ts_next(), None, packet).try_into().unwrap())
             };
 
             let peers_clone = peers.iter().map(|po| po.peer().clone()).collect::<Vec<_>>();
@@ -3897,7 +3965,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id().clone(), node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -3972,7 +4040,7 @@ pub(crate) mod tests {
         let node_a_member = MemberRekey::seal(
             &mut rng,
             member.clone(),
-            &BTreeMap::from([(member.devices[0].id(), &node_a_sync_crypto.clone().into())]),
+            &BTreeMap::from([(member.devices[0].id().clone(), node_a_sync_crypto.clone().into())]),
             vec![SecretEntry::new_current_transaction(topic_secret.clone())],
         )
         .unwrap();
@@ -4139,24 +4207,35 @@ pub(crate) mod tests {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATS").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
-        let data1 = butch.tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
-        let rm1 = TopicTransaction::new(butch.tx(
-            ts("2012-03-04T09:57:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![data1.id().clone()],
-            },
-        ));
+        let rm1 = TopicTransaction::new(
+            butch
+                .tx(
+                    ts("2012-03-04T09:57:00Z"),
+                    None,
+                    Packet::DataUnset {
+                        transaction_ids: vec![data1.id().clone()],
+                    },
+                )
+                .try_into()
+                .unwrap(),
+        );
         butch.push_tx(&id_lookup(&[&butch]), &[&rm1]).unwrap();
         butch.snapshot(rm1.id()).unwrap();
-        let data2 = butch.tx_data(ts("2012-03-04T09:58:44Z"), AppData::new("marvelous"), None, None);
+        let data2: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:58:44Z"), AppData::new("marvelous"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data2]).unwrap();
         butch.snapshot(data2.id()).unwrap();
     }
@@ -4166,40 +4245,49 @@ pub(crate) mod tests {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATS").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
-        let perms1 = {
+        let perms1: ExtTransaction = {
             let packet = Packet::MemberPermissionsChange {
                 identity_id: butch.identity().identity_id().unwrap(),
                 permissions: vec![Permission::DataSet, Permission::DataUnset, Permission::TopicRekey],
             };
-            butch.tx(ts("2024-12-08T02:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T02:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&perms1]).unwrap();
-        let data1 = butch.tx_data(ts("2024-12-08T03:00:00Z"), AppData::new("get a job"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T03:00:00Z"), AppData::new("get a job"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
-        let rm1 = butch.tx(
-            ts("2024-12-08T04:00:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![data1.id().clone()],
-            },
-        );
+        let rm1: ExtTransaction = butch
+            .tx(
+                ts("2024-12-08T04:00:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![data1.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&rm1]).unwrap();
 
         // cannot unset perms
         {
-            let rm = butch.tx(
-                ts("2024-12-08T04:00:00Z"),
-                None,
-                Packet::DataUnset {
-                    transaction_ids: vec![perms1.id().clone()],
-                },
-            );
+            let rm: ExtTransaction = butch
+                .tx(
+                    ts("2024-12-08T04:00:00Z"),
+                    None,
+                    Packet::DataUnset {
+                        transaction_ids: vec![perms1.id().clone()],
+                    },
+                )
+                .try_into()
+                .unwrap();
             let res = butch.push_tx(&id_lookup(&[&butch]), &[&rm]);
             match res {
                 Err(Error::TransactionUnsetNonDataPacket(txid)) => assert_eq!(txid, rm.id().clone()),
@@ -4209,13 +4297,16 @@ pub(crate) mod tests {
 
         // cannot unset genesis
         {
-            let rm = butch.tx(
-                ts("2024-12-08T04:00:00Z"),
-                None,
-                Packet::DataUnset {
-                    transaction_ids: vec![genesis.id().clone()],
-                },
-            );
+            let rm: ExtTransaction = butch
+                .tx(
+                    ts("2024-12-08T04:00:00Z"),
+                    None,
+                    Packet::DataUnset {
+                        transaction_ids: vec![genesis.id().clone()],
+                    },
+                )
+                .try_into()
+                .unwrap();
             let res = butch.push_tx(&id_lookup(&[&butch]), &[&rm]);
             match res {
                 Err(Error::TransactionUnsetNonDataPacket(txid)) => assert_eq!(txid, rm.id().clone()),
@@ -4225,13 +4316,16 @@ pub(crate) mod tests {
 
         // cannot unset an unset
         {
-            let rm = butch.tx(
-                ts("2024-12-08T04:00:00Z"),
-                None,
-                Packet::DataUnset {
-                    transaction_ids: vec![rm1.id().clone()],
-                },
-            );
+            let rm: ExtTransaction = butch
+                .tx(
+                    ts("2024-12-08T04:00:00Z"),
+                    None,
+                    Packet::DataUnset {
+                        transaction_ids: vec![rm1.id().clone()],
+                    },
+                )
+                .try_into()
+                .unwrap();
             let res = butch.push_tx(&id_lookup(&[&butch]), &[&rm]);
             match res {
                 Err(Error::TransactionUnsetNonDataPacket(txid)) => assert_eq!(txid, rm.id().clone()),
@@ -4248,29 +4342,41 @@ pub(crate) mod tests {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATS").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
         // create two branches
-        let data1 = butch.tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None);
-        let data2 = butch.tx_data(ts("2012-03-04T09:56:59Z"), AppData::new("ZING"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None)
+            .try_into()
+            .unwrap();
+        let data2: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:59Z"), AppData::new("ZING"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1, &data2]).unwrap();
 
         // rm data2 on branch2
-        let rm1 = butch.tx(
-            ts("2012-03-04T09:57:00Z"),
-            Some(vec![data2.id().clone()]),
-            Packet::DataUnset {
-                transaction_ids: vec![data2.id().clone()],
-            },
-        );
+        let rm1: ExtTransaction = butch
+            .tx(
+                ts("2012-03-04T09:57:00Z"),
+                Some(vec![data2.id().clone()]),
+                Packet::DataUnset {
+                    transaction_ids: vec![data2.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&rm1]).unwrap();
 
         // now merge our branches
-        let data3 = butch.tx_data(ts("2012-03-04T09:57:23Z"), AppData::new("OOPS"), None, None);
+        let data3: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:57:23Z"), AppData::new("OOPS"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data3]).unwrap();
 
         assert_eq!(topicdata!(butch).unwrap(), vec![AppData::new("get a job"), AppData::new("OOPS")],);
@@ -4298,15 +4404,21 @@ pub(crate) mod tests {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATS").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
-        let data1 = butch.tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
-        let data2 = butch.tx_data(ts("2012-03-04T09:56:59Z"), AppData::new("ZING"), None, None);
+        let data2: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:59Z"), AppData::new("ZING"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data2]).unwrap();
 
         butch.snapshot(data2.id()).unwrap();
@@ -4332,35 +4444,47 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dupephone");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2012-03-04T09:00:00Z"), None, packet)
+            butch.tx(ts("2012-03-04T09:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
         // butch and dotty both get data1
-        let data1 = butch.tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("hi im butch"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("hi im butch"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
 
         // now, butch snapshots data1 into data2.
-        let data2 = butch.tx_data(ts("2012-03-04T09:57:00Z"), AppData::new("pweased to make your acquaintance"), None, None);
+        let data2: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:57:00Z"), AppData::new("pweased to make your acquaintance"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data2]).unwrap();
         butch.snapshot(data2.id()).unwrap();
         let data2_snapshotted = butch.topic().transactions().iter().find(|t| t.id() == data2.id()).unwrap().clone();
 
         // meanwhile, dotty removes data1, snapshots the removal, then syncs butch's snapshotted
         // data2 (which refs the now-removed data1)
-        let rm1 = dotty.tx(
-            ts("2012-03-04T09:57:40Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![data1.id().clone()],
-            },
-        );
+        let rm1: ExtTransaction = dotty
+            .tx(
+                ts("2012-03-04T09:57:40Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![data1.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&rm1]).unwrap();
-        let data3 = dotty.tx_data(ts("2012-03-04T09:58:23Z"), AppData::new("nice knowing you, data1..."), None, None);
+        let data3: ExtTransaction = dotty
+            .tx_data(ts("2012-03-04T09:58:23Z"), AppData::new("nice knowing you, data1..."), None, None)
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&data3]).unwrap();
         dotty.snapshot(data3.id()).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&data2_snapshotted]).unwrap();
@@ -4385,30 +4509,39 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dupephone");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
         // butch and dotty both get data1
-        let data1 = butch.tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2012-03-04T09:56:23Z"), AppData::new("get a job"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
 
         // dotty removes data1
-        let rm1 = dotty.tx(
-            ts("2012-03-04T09:57:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![data1.id().clone()],
-            },
-        );
+        let rm1: ExtTransaction = dotty
+            .tx(
+                ts("2012-03-04T09:57:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![data1.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&rm1]).unwrap();
 
         // dotty creates data2, a post-rm1 tx.
-        let data2 = dotty.tx_data(ts("2012-03-04T09:58:23Z"), AppData::new("nice knowing you, data1..."), None, None);
+        let data2: ExtTransaction = dotty
+            .tx_data(ts("2012-03-04T09:58:23Z"), AppData::new("nice knowing you, data1..."), None, None)
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&data2]).unwrap();
 
         // this should remove data1 and rm1 from dotty
@@ -4434,15 +4567,18 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dotty");
-        let genesis = {
+        let genesis: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0), rkmember!(&dotty, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T01:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&genesis]).unwrap();
 
-        let data1 = butch.tx_data(ts("2024-12-08T02:00:00Z"), AppData::new("thsi is not a typo"), None, None);
+        let data1: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T02:00:00Z"), AppData::new("thsi is not a typo"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&data1]).unwrap();
 
@@ -4450,7 +4586,10 @@ pub(crate) mod tests {
         //
         // dotty snapshots data1, butch removes the data packet both he and dotty both have access
         // to...
-        let data2 = dotty.tx_data(ts("2024-12-08T03:00:00Z"), AppData::new("hi dupe dupe here"), None, None);
+        let data2: ExtTransaction = dotty
+            .tx_data(ts("2024-12-08T03:00:00Z"), AppData::new("hi dupe dupe here"), None, None)
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&data2]).unwrap();
         dotty.snapshot(data2.id()).unwrap();
         let data2_snapshotted = dotty
@@ -4460,13 +4599,16 @@ pub(crate) mod tests {
             .find(|tx| tx.id() == data2.id())
             .cloned()
             .unwrap();
-        let rm1 = butch.tx(
-            ts("2024-12-08T04:00:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![data1.id().clone()],
-            },
-        );
+        let rm1: ExtTransaction = butch
+            .tx(
+                ts("2024-12-08T04:00:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![data1.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&rm1]).unwrap();
 
         // now, push dotty's snapshotted tx into butch
@@ -4487,7 +4629,10 @@ pub(crate) mod tests {
         //
         // So our DAT2 snapshot contains DAT1, and even though RM1 removes DAT1, DAT2's snapshot
         // has the potential to restore DAT1 to its former glory (which we DO NOT WANT).
-        let data3 = butch.tx_data(ts("2024-12-08T05:00:00Z"), AppData::new("one tx to bring them in"), None, None);
+        let data3: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T05:00:00Z"), AppData::new("one tx to bring them in"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&data3]).unwrap();
 
         // make sure our assumptions are correct without our final snapshot
@@ -4547,25 +4692,37 @@ pub(crate) mod tests {
         // G -> H
         // E -> H
 
-        let tx_a = {
+        let tx_a: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![
                 rkmember!(&butch, admin_perms(), 0),
                 rkmember!(&dotty, admin_perms(), 0),
                 rkmember!(&jerry, vec![], 0),
             ]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T00:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
 
-        let tx_b = dotty.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None);
-        let tx_c = butch.tx_data(ts("2024-12-08T01:30:00Z"), AppData::new("C"), None, None);
-        let tx_d = butch.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("D"), None, None);
+        let tx_b: ExtTransaction = dotty
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None)
+            .try_into()
+            .unwrap();
+        let tx_c: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:30:00Z"), AppData::new("C"), None, None)
+            .try_into()
+            .unwrap();
+        let tx_d: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("D"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_c, &tx_d]).unwrap();
         dotty.push_tx(&id_lookup(&[&butch, &dotty]), &[&tx_b, &tx_c]).unwrap();
 
-        let tx_e = dotty.tx_data(ts("2024-12-08T02:00:00Z"), AppData::new("E"), None, None);
+        let tx_e: ExtTransaction = dotty
+            .tx_data(ts("2024-12-08T02:00:00Z"), AppData::new("E"), None, None)
+            .try_into()
+            .unwrap();
         dotty.push_tx(&id_lookup(&[&dotty]), &[&tx_b, &tx_e]).unwrap();
         dotty.snapshot(tx_e.id()).unwrap();
         let tx_e_snapshotted = dotty
@@ -4576,16 +4733,22 @@ pub(crate) mod tests {
             .cloned()
             .unwrap();
 
-        let tx_f = butch.tx(
-            ts("2024-12-08T02:00:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![tx_c.id().clone()],
-            },
-        );
+        let tx_f: ExtTransaction = butch
+            .tx(
+                ts("2024-12-08T02:00:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![tx_c.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_f]).unwrap();
 
-        let tx_g = butch.tx_data(ts("2024-12-08T04:00:00Z"), AppData::new("G"), None, None);
+        let tx_g: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T04:00:00Z"), AppData::new("G"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_g]).unwrap();
         butch.snapshot(tx_g.id()).unwrap();
         let tx_g_snapshotted = butch
@@ -4599,7 +4762,10 @@ pub(crate) mod tests {
         butch.push_tx(&id_lookup(&[&dotty]), &[&tx_b]).unwrap();
         butch.push_tx(&id_lookup(&[&dotty]), &[&tx_e_snapshotted]).unwrap();
 
-        let tx_h = butch.tx_data(ts("2024-12-08T06:00:00Z"), AppData::new("H"), None, None);
+        let tx_h: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T06:00:00Z"), AppData::new("H"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_h]).unwrap();
         jerry
             .push_tx(
@@ -4673,21 +4839,30 @@ pub(crate) mod tests {
         // C -> D
         // B -> D
 
-        let tx_a = {
+        let tx_a: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T00:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
 
-        let tx_b = butch.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None);
-        let tx_c = butch.tx_data(ts("2024-12-08T01:30:00Z"), AppData::new("C"), None, None);
+        let tx_b: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None)
+            .try_into()
+            .unwrap();
+        let tx_c: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:30:00Z"), AppData::new("C"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_b, &tx_c]).unwrap();
 
         butch.snapshot(tx_b.id()).unwrap();
         butch.snapshot(tx_c.id()).unwrap();
 
-        let tx_d = butch.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("D"), None, None);
+        let tx_d: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("D"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_d]).unwrap();
 
         butch.snapshot(tx_d.id()).unwrap();
@@ -4713,25 +4888,34 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
 
-        let tx_a = {
+        let tx_a: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
-            butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
+            butch.tx(ts("2024-12-08T00:00:00Z"), None, packet).try_into().unwrap()
         };
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
 
-        let tx_b = butch.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None);
+        let tx_b: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_b]).unwrap();
-        let tx_c = butch.tx_data(ts("2024-12-08T01:30:00Z"), AppData::new("C"), None, None);
+        let tx_c: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:30:00Z"), AppData::new("C"), None, None)
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_c]).unwrap();
 
-        let tx_d = butch.tx(
-            ts("2024-12-08T02:00:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![tx_b.id().clone()],
-            },
-        );
+        let tx_d: ExtTransaction = butch
+            .tx(
+                ts("2024-12-08T02:00:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![tx_b.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_d]).unwrap();
 
         // snapshot C after D has(the removal) has been pushed
@@ -4761,21 +4945,29 @@ pub(crate) mod tests {
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
 
-        let tx_a = {
+        let tx_a: ExtTransaction = {
             let (members, key_lookup) = rekey_args!(vec![rkmember!(&butch, admin_perms(), 0)]);
             let packet = butch.topic().rekey(&mut rng, members, &key_lookup).unwrap();
             butch.tx(ts("2024-12-08T00:00:00Z"), None, packet)
-        };
+        }
+        .try_into()
+        .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_a]).unwrap();
 
-        let tx_b = butch.tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None);
-        let tx_c = butch.tx(
-            ts("2024-12-08T02:00:00Z"),
-            None,
-            Packet::DataUnset {
-                transaction_ids: vec![tx_b.id().clone()],
-            },
-        );
+        let tx_b: ExtTransaction = butch
+            .tx_data(ts("2024-12-08T01:00:00Z"), AppData::new("B"), None, None)
+            .try_into()
+            .unwrap();
+        let tx_c: ExtTransaction = butch
+            .tx(
+                ts("2024-12-08T02:00:00Z"),
+                None,
+                Packet::DataUnset {
+                    transaction_ids: vec![tx_b.id().clone()],
+                },
+            )
+            .try_into()
+            .unwrap();
         butch.push_tx(&id_lookup(&[&butch]), &[&tx_b]).unwrap();
         match butch.push_tx(&id_lookup(&[&butch]), &[&tx_c]) {
             Ok(_) => panic!("expecting causal unset error"),

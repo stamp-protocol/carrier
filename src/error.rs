@@ -9,6 +9,10 @@ use thiserror::Error;
 /// which an expectation is not met or a problem occurs.
 #[derive(Error, Debug)]
 pub enum Error {
+    /// Key packet is missing data/fields
+    #[error("key packet is malformed")]
+    KeyPacketMalformed,
+
     /// A key packet has been tampered with
     #[error("key packet tampered with")]
     KeyPacketTampered,
@@ -36,10 +40,6 @@ pub enum Error {
     /// the time-space vortex.
     #[error("rekey generation failed, missing device key map for identity {0} / device {1:?}")]
     MemberRekeyMissingDevicePubkeyMappingEntry(IdentityID, DeviceID),
-
-    /// A packet was encountered that doesn't make any sense
-    #[error("invalid packet: {0}")]
-    PacketInvalid(TransactionID),
 
     /// We're assigning someone permissions we do not have.
     #[error("permission change failed (identity {0}, permission {1:?})")]
@@ -86,6 +86,10 @@ pub enum Error {
     /// meaningful way. You can test this via `TopicTransaction.is_empty()`
     #[error("cannot read an empty transaction: {0}")]
     TransactionIsEmpty(TransactionID),
+
+    /// We're trying to get the `TopicID` of a transaction that doesn't have that set into it.
+    #[error("transaction {0} does not have a topic id associated with it")]
+    TransactionMissingTopicID(TransactionID),
 
     /// Someone is attempting to unset a control packet
     #[error("cannot unset a control packet: {0}")]
