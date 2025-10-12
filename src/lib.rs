@@ -7,7 +7,7 @@ use rasn::{AsnType, Decode, Decoder, Encode, Encoder};
 use stamp_core::{
     crypto::base::{
         rng::{CryptoRng, RngCore},
-        CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey, SignKeypair, SignKeypairPublic, SignKeypairSignature,
+        CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey,
     },
     dag::{Dag, DagNode, ExtTransaction, Transaction, TransactionBody, TransactionID, Transactions},
     identity::IdentityID,
@@ -459,62 +459,14 @@ pub struct SnapshotEntry {
 }
 
 impl SnapshotEntry {
+    /// Create a new snapshot entry
     fn new(ordered_transactions: Vec<SnapshotOrderedOp>) -> Self {
         Self { ordered_transactions }
-    }
-}
-
-impl SerdeBinary for SnapshotEntry {}
-
-/// A snapshot of the current state of the DAG with all previous operations rolled up into one
-/// state object. This allows compression by removing deleted transactions and combining edits on the
-/// same object.
-#[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
-#[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
-pub struct Snapshot {
-    /// This snapshot's ID, which is a hash of the `entry` field. This prevents tampering.
-    #[rasn(tag(explicit(0)))]
-    id: SnapshotID,
-    /// The snapshot data/metadata. This holds the snapshot state and also the [`TransactionID`] of
-    /// the operation the snapshot is replacing. This prevents the snapshot from being tampered
-    /// with by anyone without the sign keys.
-    #[rasn(tag(explicit(1)))]
-    entry: SnapshotEntry,
-    /// A signature on the `id` field.
-    #[rasn(tag(explicit(2)))]
-    signature: SignKeypairSignature,
-}
-
-impl Snapshot {
-    /// Create a new, valid, signed snapshot.
-    pub fn new(master_key: &SecretKey, sign_key: &SignKeypair, ordered_transactions: Vec<SnapshotOrderedOp>) -> Result<Self> {
-        let entry = SnapshotEntry::new(ordered_transactions);
-        let entry_ser = entry.serialize_binary()?;
-        let id = SnapshotID(Hash::new_blake3(&entry_ser)?);
-        let id_ser = id.serialize_binary()?;
-        let signature = sign_key.sign(master_key, &id_ser)?;
-        Ok(Self { id, entry, signature })
-    }
-
-    /// Verify that this snapshot is valid (its ID and signature on that ID). Returns the *last*
-    /// [`TransactionID`] in the snapshot's `ordered_transactions` chain.
-    pub fn verify(&self, sign_pubkey: &SignKeypairPublic) -> Result<TransactionID> {
-        let entry_ser = self.entry().serialize_binary()?;
-        let id_comp = SnapshotID(Hash::new_blake3(&entry_ser)?);
-        if self.id() != &id_comp {
-            Err(Error::SnapshotTampered)?;
-        }
-        let id_ser = self.id().serialize_binary()?;
-        sign_pubkey.verify(self.signature(), &id_ser)?;
-        let ops = self.all_transactions();
-        let last = ops[ops.len() - 1].clone();
-        Ok(last)
     }
 
     /// An ordered list of all the active nodes this snapshot holds (set operations)
     pub fn active_transactions(&self) -> Vec<&TransactionID> {
-        self.entry()
-            .ordered_transactions()
+        self.ordered_transactions()
             .iter()
             .filter(|x| x.is_keep())
             .map(|x| x.transaction_id())
@@ -523,8 +475,7 @@ impl Snapshot {
 
     /// An ordered list of all the active nodes this snapshot holds (set operations)
     pub fn removed_transactions(&self) -> Vec<&TransactionID> {
-        self.entry()
-            .ordered_transactions()
+        self.ordered_transactions()
             .iter()
             .filter(|x| x.is_remove())
             .map(|x| x.transaction_id())
@@ -533,13 +484,72 @@ impl Snapshot {
 
     /// An ordered list of all the nodes referenced in this snapshot (active and removed)
     pub fn all_transactions(&self) -> Vec<&TransactionID> {
-        self.entry()
-            .ordered_transactions()
-            .iter()
-            .map(|x| x.transaction_id())
-            .collect::<Vec<_>>()
+        self.ordered_transactions().iter().map(|x| x.transaction_id()).collect::<Vec<_>>()
     }
 }
+
+impl SerdeBinary for SnapshotEntry {}
+
+/// A snapshot of the current state of the DAG with all previous operations rolled up into one
+/// state object. This allows compression by removing deleted transactions and combining edits on the
+/// same object.
+#[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord)]
+#[rasn(delegate)]
+pub struct Snapshot(ExtTransaction);
+
+impl Snapshot {
+    /// Create a new `KeyPacket`
+    pub fn new<T: Into<Timestamp> + Clone>(
+        identity: &Transactions,
+        hash_with: &HashAlgo,
+        now: T,
+        ordered_transactions: Vec<SnapshotOrderedOp>,
+    ) -> Result<Self> {
+        let entry_bytes = SnapshotEntry::new(ordered_transactions).serialize_binary()?;
+        let ext = ExtTransaction::try_from(
+            identity
+                .ext(
+                    hash_with,
+                    now,
+                    Vec::new(),
+                    Some(BinaryVec::from(Vec::from(b"/stamp/sync/v1/snapshot"))),
+                    None::<HashMapAsn1<BinaryVec, BinaryVec>>,
+                    BinaryVec::from(entry_bytes),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        Ok(Self(ext))
+    }
+
+    /// Get the [`SnapshotEntry`] from this entry.
+    pub fn get_entry(&self) -> Result<SnapshotEntry> {
+        let payload = self.0.get_payload()?;
+        let entry = SnapshotEntry::deserialize_binary(payload.as_slice())?;
+        Ok(entry)
+    }
+}
+
+impl From<ExtTransaction> for Snapshot {
+    fn from(val: ExtTransaction) -> Self {
+        Self(val)
+    }
+}
+
+impl Deref for Snapshot {
+    type Target = ExtTransaction;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Snapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl SerdeBinary for Snapshot {}
 
 /// A wrapper around the [`Transaction`] type, allowing for snapshots and custom DAG ordering.
 #[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
@@ -1081,21 +1091,22 @@ impl Topic {
         our_device_id: &DeviceID,
     ) -> Result<TopicDagModificationResult> {
         // index transactions we've already processed here
-        let mut exists_idx: HashSet<&TransactionID> = HashSet::with_capacity(self.transactions().len());
+        let mut exists_idx: HashSet<TransactionID> = HashSet::with_capacity(self.transactions().len());
         let nodes_old = self
             .transactions()
             .iter()
             .map(|x| {
-                exists_idx.insert(x.id());
+                exists_idx.insert(x.id().clone());
                 // also push known snapshotted transactions into our existing list
                 if let Some(snap) = x.snapshot().as_ref() {
-                    for op in snap.entry().ordered_transactions() {
-                        exists_idx.insert(op.transaction_id());
+                    let entry = snap.get_entry()?;
+                    for op in entry.ordered_transactions() {
+                        exists_idx.insert(op.transaction_id().clone());
                     }
                 }
-                x.into()
+                Ok(x.into())
             })
-            .collect::<Vec<DagNode<_, _>>>();
+            .collect::<Result<Vec<DagNode<_, _>>>>()?;
         let transactions_new_filtered_deduped = transactions
             .into_iter()
             .filter(|t| !exists_idx.contains(t.id()))
@@ -1346,11 +1357,8 @@ impl Topic {
                 tx_index.insert(tx.id(), tx);
                 if let Some(snapshot) = tx.snapshot.as_ref() {
                     snapshots.push(snapshot);
-                    //{
-                    //let entry = snapshots.entry(tx.id()).or_insert_with(|| Vec::new());
-                    //entry.push(snapshot);
-                    //}
-                    for op in snapshot.entry().ordered_transactions() {
+                    let entry = snapshot.get_entry()?;
+                    for op in entry.ordered_transactions() {
                         if let SnapshotOrderedOp::Remove { id, timestamp } = op {
                             snapshot_unsets.insert(id.clone(), timestamp.clone());
                         }
@@ -1407,7 +1415,8 @@ impl Topic {
             // stores the transaction id of the previous loop's operation. this allows us to
             // set previous_transactions for each of our snapshotted tx
             let mut last_snap_transaction_id: Option<TransactionID> = None;
-            for snap_op in snapshot.entry().ordered_transactions() {
+            let entry = snapshot.get_entry()?;
+            for snap_op in entry.ordered_transactions() {
                 let mut mods = Vec::new();
                 // if this is a removal, we need to mark it for re-creation, otherwise we assume
                 // that the tx already exists in the original transactions list and can be
@@ -1625,20 +1634,23 @@ impl Topic {
     /// `D`, `E`, or `F` because they are on a different causal chain. Snapshotting `G` would
     /// include `A`, `B`, `C`, `D`, `E`, `F` and `G`.
     ///
-    /// This returns a list of all operations that have been removed by the snapshot process,
-    /// allowing deletion in whatever storage mechanism.
+    /// This returns a mutable references to the snapshot that is created, allowing easy signing by
+    /// the needed identity admin keys, as well as a list of all operations that have been removed
+    /// by the snapshot process, allowing deletion in whatever storage mechanism.
     #[tracing::instrument(ret, err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], replaces = %&format!("{replaces}")[0..8]))]
-    pub fn snapshot(
-        &mut self,
-        master_key: &SecretKey,
-        sign_key: &SignKeypair,
+    pub fn snapshot<'a, T: Into<Timestamp> + Clone>(
+        &'a mut self,
+        identity: &Transactions,
+        hash_with: &HashAlgo,
+        now: T,
         replaces: &TransactionID,
     ) -> Result<BTreeSet<TransactionID>> {
         // if our replacement node is inside of an existing snapshot, that's basically a NOP and we
         // just return without touching anything.
         for trans in self.transactions() {
             if let Some(snap) = trans.snapshot().as_ref() {
-                if snap.all_transactions().contains(&replaces) {
+                let entry = snap.get_entry()?;
+                if entry.all_transactions().contains(&replaces) {
                     Err(Error::SnapshotCollision(trans.id().clone()))?;
                 }
             }
@@ -1648,11 +1660,11 @@ impl Topic {
                 // this tracks nodes that either a) unset other nodes or b) have been unset
                 let mut unsets_in_causal_chain: HashSet<TransactionID> = HashSet::new();
                 // tracks transactions that are part of another snapshot
-                let mut in_existing_snapshot: HashMap<&TransactionID, &SnapshotOrderedOp> = HashMap::new();
+                let mut in_existing_snapshot: HashMap<TransactionID, SnapshotOrderedOp> = HashMap::new();
                 // track transactions that have been removed as part of other previous snapshots. we
                 // need to do this so we don't go trying to load data from these removals (which will
                 // be expanded to fake transactions by `with_expanded_snapshots()`)
-                let mut previously_snapshotted_removals: HashMap<&TransactionID, &SnapshotOrderedOp> = HashMap::new();
+                let mut previously_snapshotted_removals: HashMap<TransactionID, SnapshotOrderedOp> = HashMap::new();
                 // a list of transactions that are being removed by this snapshot. this is returned to the
                 // caller so these transactions can be wiped from storage.
                 let mut removed = BTreeSet::new();
@@ -1685,10 +1697,11 @@ impl Topic {
                     }
                     // track and save a) all previously snapshotted tx and b) all removals
                     if let Some(snapshot) = tx.snapshot() {
-                        for op in snapshot.entry().ordered_transactions() {
-                            in_existing_snapshot.insert(op.transaction_id(), op);
+                        let entry = snapshot.get_entry()?;
+                        for op in entry.ordered_transactions() {
+                            in_existing_snapshot.insert(op.transaction_id().clone(), op.clone());
                             if let SnapshotOrderedOp::Remove { id, .. } = op {
-                                previously_snapshotted_removals.insert(id, op);
+                                previously_snapshotted_removals.insert(id.clone(), op.clone());
                             }
                         }
                     }
@@ -1725,7 +1738,7 @@ impl Topic {
                         snapshot_ordered_operations.push(save);
                         let snapshot_ops = snapshot_ordered_operations;
                         snapshot_ordered_operations = Vec::new();
-                        tx.snapshot = Some(Snapshot::new(master_key, sign_key, snapshot_ops)?);
+                        tx.snapshot = Some(Snapshot::new(identity, hash_with, now.clone(), snapshot_ops)?);
                         final_nodes.push(tx);
                     } else if include_in_current_snapshot.contains(&node_id) {
                         // the current tx should be included in the current snapshot we're
@@ -1795,7 +1808,7 @@ pub(crate) mod tests {
     use stamp_core::{
         crypto::base::{
             rng::{self, ChaCha20Rng, CryptoRng, RngCore},
-            Hash, HashAlgo, SecretKey,
+            Hash, HashAlgo, SecretKey, SignKeypair,
         },
         dag::tx_chain,
         identity::keychain::{AdminKey, ExtendKeypair, Key},
@@ -1941,7 +1954,7 @@ pub(crate) mod tests {
                     "{}{}",
                     short(tx.id()),
                     if let Some(snap) = tx.snapshot().as_ref() {
-                        format!(" ({})", snap.entry().ordered_transactions().len())
+                        format!(" ({})", snap.get_entry().unwrap().ordered_transactions().len())
                     } else {
                         String::new()
                     }
@@ -2328,17 +2341,21 @@ pub(crate) mod tests {
 
         fn snapshot(&self, replaces: &TransactionID) -> Result<BTreeSet<TransactionID>> {
             let identity = self.identity().build_identity().unwrap();
-            let sign_key = identity
-                .keychain()
-                .subkey_by_name("/stamp/sync/v1/sign")
-                .unwrap()
-                .key()
-                .as_signkey()
-                .unwrap();
+            let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap().key();
             let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
             let mut topic = self.topic.replace(fake_topic);
-            let res = match topic.snapshot(self.master_key(), sign_key, replaces) {
+            let res = match topic.snapshot(self.identity(), &HashAlgo::Blake3, ts("2028-04-13T06:07:08Z"), replaces) {
                 Ok(res) => {
+                    topic
+                        .transactions_mut()
+                        .iter_mut()
+                        .find(|t| t.id() == replaces)
+                        .unwrap()
+                        .snapshot_mut()
+                        .as_mut()
+                        .unwrap()
+                        .sign_mut(self.master_key(), admin_key)
+                        .unwrap();
                     self.topic.replace(topic);
                     res
                 }
@@ -3290,6 +3307,8 @@ pub(crate) mod tests {
                 .snapshot()
                 .as_ref()
                 .unwrap()
+                .get_entry()
+                .unwrap()
                 .all_transactions(),
             vec![&genesis, &rekey1, &data1, &data2, &rm1, &data4, &data3, &data5, &data6,]
                 .into_iter()
@@ -3506,6 +3525,8 @@ pub(crate) mod tests {
                 .snapshot()
                 .as_ref()
                 .unwrap()
+                .get_entry()
+                .unwrap()
                 .all_transactions()
                 .iter()
                 .map(|t| format!("{t}"))
@@ -3671,7 +3692,11 @@ pub(crate) mod tests {
                         let in_existing_snap = topic
                             .transactions()
                             .iter()
-                            .filter_map(|t| t.snapshot().as_ref().map(|s| s.all_transactions()))
+                            .filter_map(|t| {
+                                t.snapshot()
+                                    .as_ref()
+                                    .map(|s| s.get_entry().unwrap().all_transactions().into_iter().cloned().collect::<Vec<_>>())
+                            })
                             .flatten()
                             .collect::<HashSet<_>>();
                         topic
@@ -3696,7 +3721,9 @@ pub(crate) mod tests {
                                 .snapshot()
                                 .as_ref()
                                 .map(|s| {
-                                    s.all_transactions()
+                                    s.get_entry()
+                                        .unwrap()
+                                        .all_transactions()
                                         .iter()
                                         .map(|id| String::from(&format!("{id}")[0..8]))
                                         .collect::<Vec<_>>()
@@ -4016,7 +4043,6 @@ pub(crate) mod tests {
                 .unwrap(),
         );
         let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
-        let node_a_sync_sig = SignKeypair::new_ed25519(&mut rng, &master_key).unwrap();
         let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
 
         let topic_id = TopicID::new(&mut rng);
@@ -4125,7 +4151,9 @@ pub(crate) mod tests {
         {
             let mut topic = mktopic!(topic_tx.clone());
             let e_id = name_to_tx.get("E").unwrap().id();
-            topic.snapshot(&master_key, &node_a_sync_sig, e_id).unwrap();
+            topic
+                .snapshot(&transactions, &HashAlgo::Blake3, ts("2023-01-01T00:00:00Z"), e_id)
+                .unwrap();
             assert_eq!(
                 topic
                     .transactions()
@@ -4141,7 +4169,16 @@ pub(crate) mod tests {
             assert_op!(topic, id_to_name, 3, "D", false);
             assert_op!(topic, id_to_name, 4, "E", true);
             assert_eq!(
-                ids_to_names(&id_to_name, &topic.transactions()[4].snapshot().as_ref().unwrap().active_transactions()),
+                ids_to_names(
+                    &id_to_name,
+                    &topic.transactions()[4]
+                        .snapshot()
+                        .as_ref()
+                        .unwrap()
+                        .get_entry()
+                        .unwrap()
+                        .active_transactions()
+                ),
                 vec!["A", "B", "C", "E"],
             );
             assert_op!(topic, id_to_name, 5, "F", false);
@@ -4170,7 +4207,9 @@ pub(crate) mod tests {
         {
             let mut topic = mktopic!(topic_tx.clone());
             let h_id = name_to_tx.get("J").unwrap().id();
-            topic.snapshot(&master_key, &node_a_sync_sig, h_id).unwrap();
+            topic
+                .snapshot(&transactions, &HashAlgo::Blake3, ts("2023-01-01T00:00:00Z"), h_id)
+                .unwrap();
             assert_op!(topic, id_to_name, 0, "A", false);
             assert_op!(topic, id_to_name, 1, "B", false);
             assert_op!(topic, id_to_name, 2, "C", false);
@@ -4182,7 +4221,16 @@ pub(crate) mod tests {
             assert_op!(topic, id_to_name, 8, "I", false);
             assert_op!(topic, id_to_name, 9, "J", true);
             assert_eq!(
-                ids_to_names(&id_to_name, &topic.transactions()[9].snapshot().as_ref().unwrap().active_transactions()),
+                ids_to_names(
+                    &id_to_name,
+                    &topic.transactions()[9]
+                        .snapshot()
+                        .as_ref()
+                        .unwrap()
+                        .get_entry()
+                        .unwrap()
+                        .active_transactions()
+                ),
                 vec!["A", "G", "H", "I", "J"],
             );
             assert_op!(topic, id_to_name, 10, "K", false);
