@@ -54,19 +54,14 @@ impl KeyPacket {
     ) -> Result<Self> {
         let device_bytes = device_id.serialize_binary().unwrap();
         let pubkey_bytes = pubkey.serialize_binary().unwrap();
-        let ext = ExtTransaction::try_from(
-            identity
-                .ext(
-                    hash_with,
-                    now,
-                    Vec::new(),
-                    Some(BinaryVec::from(Vec::from(b"/stamp/sync/v1/keypacket"))),
-                    Some([(b"device_id".as_slice(), device_bytes.as_slice())]),
-                    BinaryVec::from(pubkey_bytes),
-                )
-                .unwrap(),
-        )
-        .unwrap();
+        let ext = ExtTransaction::try_from(identity.ext(
+            hash_with,
+            now,
+            Vec::new(),
+            Some(BinaryVec::from(Vec::from(b"/stamp/sync/v1/keypacket"))),
+            Some([(b"device_id".as_slice(), device_bytes.as_slice())]),
+            BinaryVec::from(pubkey_bytes),
+        )?)?;
         Ok(Self(ext))
     }
 
@@ -506,19 +501,14 @@ impl Snapshot {
         ordered_transactions: Vec<SnapshotOrderedOp>,
     ) -> Result<Self> {
         let entry_bytes = SnapshotEntry::new(ordered_transactions).serialize_binary()?;
-        let ext = ExtTransaction::try_from(
-            identity
-                .ext(
-                    hash_with,
-                    now,
-                    Vec::new(),
-                    Some(BinaryVec::from(Vec::from(b"/stamp/sync/v1/snapshot"))),
-                    None::<HashMapAsn1<BinaryVec, BinaryVec>>,
-                    BinaryVec::from(entry_bytes),
-                )
-                .unwrap(),
-        )
-        .unwrap();
+        let ext = ExtTransaction::try_from(identity.ext(
+            hash_with,
+            now,
+            Vec::new(),
+            Some(BinaryVec::from(Vec::from(b"/stamp/sync/v1/snapshot"))),
+            None::<HashMapAsn1<BinaryVec, BinaryVec>>,
+            BinaryVec::from(entry_bytes),
+        )?)?;
         Ok(Self(ext))
     }
 
