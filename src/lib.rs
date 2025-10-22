@@ -103,7 +103,21 @@ impl DerefMut for KeyPacket {
     }
 }
 
-impl SerdeBinary for KeyPacket {}
+impl SerdeBinary for KeyPacket {
+    fn deserialize_binary(slice: &[u8]) -> stamp_core::error::Result<Self> {
+        let tx = ExtTransaction::deserialize_binary(slice)?;
+        match tx.get_ty()? {
+            Some(ty) => {
+                if ty.deref() != b"/stamp/sync/v1/keypacket" {
+                    Err(stamp_core::error::Error::TransactionMismatch)?;
+                }
+            }
+            None => Err(stamp_core::error::Error::TransactionMismatch)?,
+        }
+
+        Ok(Self::from(tx))
+    }
+}
 
 /// Represents a unique ID for a member device. Randomly generated, probably.
 #[derive(Debug, Clone, AsnType, Encode, Decode, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -493,7 +507,7 @@ impl SerdeBinary for SnapshotEntry {}
 pub struct Snapshot(ExtTransaction);
 
 impl Snapshot {
-    /// Create a new `KeyPacket`
+    /// Create a new `Snapshot`
     pub fn new<T: Into<Timestamp> + Clone>(
         identity: &Transactions,
         hash_with: &HashAlgo,
@@ -539,7 +553,21 @@ impl DerefMut for Snapshot {
     }
 }
 
-impl SerdeBinary for Snapshot {}
+impl SerdeBinary for Snapshot {
+    fn deserialize_binary(slice: &[u8]) -> stamp_core::error::Result<Self> {
+        let tx = ExtTransaction::deserialize_binary(slice)?;
+        match tx.get_ty()? {
+            Some(ty) => {
+                if ty.deref() != b"/stamp/sync/v1/snapshot" {
+                    Err(stamp_core::error::Error::TransactionMismatch)?;
+                }
+            }
+            None => Err(stamp_core::error::Error::TransactionMismatch)?,
+        }
+
+        Ok(Self::from(tx))
+    }
+}
 
 /// A wrapper around the [`Transaction`] type, allowing for snapshots and custom DAG ordering.
 #[derive(Clone, Debug, AsnType, Encode, Decode, getset::Getters, getset::MutGetters, getset::Setters)]
