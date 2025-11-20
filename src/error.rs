@@ -61,7 +61,7 @@ pub enum Error {
     #[error("snapshot tampered with")]
     SnapshotTampered,
 
-    /// An error occured in the Stamp protocol itself
+    /// An error occurred in the Stamp protocol itself
     #[error("stamp error: {0}")]
     Stamp(#[from] stamp_core::error::Error),
 

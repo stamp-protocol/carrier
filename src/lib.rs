@@ -579,7 +579,7 @@ pub struct TopicTransaction {
     /// A snapshot. This rolls up all previous transactions, *including this one* into a single
     /// state.
     ///
-    /// Note that a snapshot doesn't explicitely *store* transactions or their data, but rather
+    /// Note that a snapshot doesn't explicitly *store* transactions or their data, but rather
     /// preserves their order as a signed (tamperproof) container, allowing deletion of unset data
     /// but preserving the exact order from the original DAG.
     #[rasn(tag(explicit(1)))]
@@ -1027,7 +1027,7 @@ impl Topic {
     /// This takes a list of the full identities of the participants in the topic and a list of our
     /// crypto keypairs and a) verifies each transaction against the identity it came from and b)
     /// uses our crypto keypairs to decrypt any topic secrets in the control packets. This allows
-    /// us to full build our topic state.
+    /// us to fully build our topic state.
     pub fn new_from_transactions(
         id: TopicID,
         transactions: Vec<TopicTransaction>,
