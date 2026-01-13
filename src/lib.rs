@@ -7,10 +7,11 @@ use rasn::{AsnType, Decode, Decoder, Encode, Encoder};
 use stamp_core::{
     crypto::base::{
         rng::{CryptoRng, RngCore},
-        CryptoKeypair, CryptoKeypairPublic, Hash, HashAlgo, Sealed, SecretKey,
+        CryptoKeypair, Hash, HashAlgo, Sealed, SecretKey,
     },
-    dag::{Dag, DagNode, ExtTransaction, Transaction, TransactionBody, TransactionID, Transactions},
+    dag::{Dag, DagNode, DagTamperUtil, ExtTransaction, Identity, Transaction, TransactionBody, TransactionID},
     identity::IdentityID,
+    private_parts::{Full, Public},
     util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -33,7 +34,7 @@ pub enum Permission {
     /// Allows changing member's permissions
     #[rasn(tag(explicit(3)))]
     MemberPermissionsChange,
-    /// Allows re-keying the topic
+    /// Allows re-keying the topic, which also controls who is a member of the topic.
     #[rasn(tag(explicit(4)))]
     TopicRekey,
 }
@@ -46,11 +47,11 @@ pub struct KeyPacket(ExtTransaction);
 impl KeyPacket {
     /// Create a new `KeyPacket`
     pub fn new<T: Into<Timestamp> + Clone>(
-        identity: &Transactions,
+        identity: &Identity<Full>,
         hash_with: &HashAlgo,
         now: T,
         device_id: &DeviceID,
-        pubkey: &CryptoKeypairPublic,
+        pubkey: &CryptoKeypair<Public>,
     ) -> Result<Self> {
         let device_bytes = device_id.serialize_binary().unwrap();
         let pubkey_bytes = pubkey.serialize_binary().unwrap();
@@ -77,9 +78,9 @@ impl KeyPacket {
     }
 
     /// Get this packet's pubkey
-    pub fn get_pubkey(&self) -> Result<CryptoKeypairPublic> {
+    pub fn get_pubkey(&self) -> Result<CryptoKeypair<Public>> {
         let payload = self.get_payload()?;
-        let pubkey = CryptoKeypairPublic::deserialize_binary(&payload)?;
+        let pubkey = CryptoKeypair::<Public>::deserialize_binary(&payload)?;
         Ok(pubkey)
     }
 }
@@ -242,7 +243,7 @@ impl SerdeBinary for SecretEntry {}
 struct RekeyMessage {
     /// The key we're using to encrypt the message
     #[rasn(tag(explicit(0)))]
-    to_key: CryptoKeypairPublic,
+    to_key: CryptoKeypair<Public>,
     /// The encrypted message
     #[rasn(tag(explicit(1)))]
     message: BinaryVec,
@@ -250,7 +251,7 @@ struct RekeyMessage {
 
 impl RekeyMessage {
     /// Create a new `RekeyMessage`.
-    pub fn new(to_key: CryptoKeypairPublic, message: Vec<u8>) -> Self {
+    pub fn new(to_key: CryptoKeypair<Public>, message: Vec<u8>) -> Self {
         Self {
             to_key,
             message: message.into(),
@@ -279,7 +280,7 @@ impl MemberRekey {
     pub fn seal<R: RngCore + CryptoRng>(
         rng: &mut R,
         member: Member,
-        device_key_map: &BTreeMap<DeviceID, CryptoKeypairPublic>,
+        device_key_map: &BTreeMap<DeviceID, CryptoKeypair<Public>>,
         secrets: Vec<SecretEntry>,
     ) -> Result<Self> {
         let secret_ser = secrets.serialize_binary()?;
@@ -305,7 +306,7 @@ impl MemberRekey {
     pub fn open(
         self,
         recipient_master_key: &SecretKey,
-        recipient_crypto_keypairs: &[&CryptoKeypair],
+        recipient_crypto_keypairs: &[&CryptoKeypair<Full>],
         our_device_id: &DeviceID,
         transaction_id: &TransactionID,
     ) -> Result<(Member, Vec<SecretEntry>)> {
@@ -453,7 +454,7 @@ impl SnapshotOrderedOp {
 #[getset(get = "pub", get_mut = "pub(crate)", set = "pub(crate)")]
 pub struct SnapshotEntry {
     /// The operations we're rolling into this snapshot **in causal order**. This is effectively
-    /// all operations that have occurred before the operation being snapshotted *on the same DAG
+    /// all operations that have occurred before the operation being snapshotted on the same DAG
     /// *not* in any of the backlinks should *not* be snapshotted.
     ///
     /// Note although the snapshot erases nodes that are unsets or are targets of unsets, we will
@@ -509,7 +510,7 @@ pub struct Snapshot(ExtTransaction);
 impl Snapshot {
     /// Create a new `Snapshot`
     pub fn new<T: Into<Timestamp> + Clone>(
-        identity: &Transactions,
+        identity: &Identity<Full>,
         hash_with: &HashAlgo,
         now: T,
         ordered_transactions: Vec<SnapshotOrderedOp>,
@@ -876,7 +877,7 @@ impl TopicState {
         transaction: &TopicTransaction,
         dag: &Dag<TransactionID, TopicTransaction>,
         our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
+        our_crypto_keypairs: &[&CryptoKeypair<Full>],
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
     ) -> Result<()> {
@@ -1031,9 +1032,9 @@ impl Topic {
     pub fn new_from_transactions(
         id: TopicID,
         transactions: Vec<TopicTransaction>,
-        identities: &HashMap<IdentityID, &Transactions>,
+        identities: &HashMap<IdentityID, &Identity<Public>>,
         our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
+        our_crypto_keypairs: &[&CryptoKeypair<Full>],
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
     ) -> Result<Self> {
@@ -1054,7 +1055,7 @@ impl Topic {
         &self,
         rng: &mut R,
         members: Vec<Member>,
-        device_key_map: &BTreeMap<DeviceID, CryptoKeypairPublic>,
+        device_key_map: &BTreeMap<DeviceID, CryptoKeypair<Public>>,
     ) -> Result<Packet> {
         let mut secrets = self.secrets().clone();
         secrets.push(SecretEntry::new_current_transaction(TopicSecret::new(rng)));
@@ -1080,9 +1081,9 @@ impl Topic {
     pub fn push_transactions(
         mut self,
         transactions: Vec<TopicTransaction>,
-        identities: &HashMap<IdentityID, &Transactions>,
+        identities: &HashMap<IdentityID, &Identity<Public>>,
         our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
+        our_crypto_keypairs: &[&CryptoKeypair<Full>],
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
     ) -> Result<Self> {
@@ -1102,9 +1103,9 @@ impl Topic {
     pub fn push_transactions_mut(
         &mut self,
         transactions: Vec<TopicTransaction>,
-        identities: &HashMap<IdentityID, &Transactions>,
+        identities: &HashMap<IdentityID, &Identity<Public>>,
         our_master_key: &SecretKey,
-        our_crypto_keypairs: &[&CryptoKeypair],
+        our_crypto_keypairs: &[&CryptoKeypair<Full>],
         our_identity_id: &IdentityID,
         our_device_id: &DeviceID,
     ) -> Result<TopicDagModificationResult> {
@@ -1141,8 +1142,8 @@ impl Topic {
             let identity_tx = identities
                 .get(trans_identity_id)
                 .ok_or_else(|| Error::IdentityMissing(trans_identity_id.clone()))?;
-            let identity = identity_tx.build_identity_at_point_in_history(prev)?;
-            trans.transaction().verify(Some(&identity))?;
+            let identity = identity_tx.build_identity_instance_at_point_in_history(prev)?;
+            trans.transaction().authorize(Some(&identity))?;
             // also, look for any key changes
             if let Packet::TopicRekey { .. } = trans.get_packet()? {
                 contains_key_changes = true;
@@ -1303,13 +1304,13 @@ impl Topic {
     /// Create a Stamp transaction from a packet.
     pub fn transaction_from_packet<T, K>(
         &self,
-        transactions: &Transactions,
+        identity: &Identity<Full>,
         hash_with: &HashAlgo,
         previous_transactions: Option<Vec<TransactionID>>,
         context: Option<K>,
         now: T,
         packet: &Packet,
-    ) -> Result<Transaction>
+    ) -> Result<Transaction<Full>>
     where
         T: Into<Timestamp> + Clone,
         K: Into<HashMapAsn1<BinaryVec, BinaryVec>>,
@@ -1326,7 +1327,7 @@ impl Topic {
             ctx.insert(Vec::from(b"topic_id".as_slice()).into(), topic_id_ser.into());
             ctx
         });
-        let trans = transactions.ext(hash_with, now, prev, Some(ty.into()), context, packet_ser.into())?;
+        let trans = identity.ext(hash_with, now, prev, Some(ty.into()), context, packet_ser.into())?;
         Ok(trans)
     }
 
@@ -1516,7 +1517,7 @@ impl Topic {
             // if we DON'T have a Resurrect, we attempt to pull and existing transaction from our
             // tx index. if that doesn't exist, we cry about it.
             let mut tx = if let Modification::Resurrect(ref timestamp) = mods[0] {
-                let trans = Transaction::create_raw_with_id(
+                let trans = Transaction::<Public>::create_raw_with_id(
                     tx_id.clone(),
                     timestamp.clone(),
                     vec![],
@@ -1658,7 +1659,7 @@ impl Topic {
     #[tracing::instrument(ret, err(Debug), skip_all, fields(topic_id = %&format!("{}", self.id())[0..8], replaces = %&format!("{replaces}")[0..8]))]
     pub fn snapshot<'a, T: Into<Timestamp> + Clone>(
         &'a mut self,
-        identity: &Transactions,
+        identity: &Identity<Full>,
         hash_with: &HashAlgo,
         now: T,
         replaces: &TransactionID,
@@ -1829,7 +1830,7 @@ pub(crate) mod tests {
             Hash, HashAlgo, SecretKey, SignKeypair,
         },
         dag::tx_chain,
-        identity::keychain::{AdminKey, ExtendKeypair, Key},
+        identity::keychain::{AdminKey, Key},
     };
     use std::cell::{Ref, RefCell};
     use std::collections::HashMap;
@@ -1859,8 +1860,8 @@ pub(crate) mod tests {
         rng: &mut R,
         now: Timestamp,
         master_key: SecretKey,
-    ) -> (SecretKey, Transactions, AdminKey) {
-        let transactions = stamp_core::dag::Transactions::new();
+    ) -> (SecretKey, Identity<Full>, AdminKey<Full>) {
+        let identity = stamp_core::dag::Identity::new();
         let admin = stamp_core::identity::keychain::AdminKeypair::new_ed25519(rng, &master_key).unwrap();
         let admin_key = stamp_core::identity::keychain::AdminKey::new(admin, "Alpha", None);
         let policy = stamp_core::policy::Policy::new(
@@ -1872,40 +1873,40 @@ pub(crate) mod tests {
         );
         let sign_key = Key::new_sign(SignKeypair::new_ed25519(rng, &master_key).unwrap());
         let crypto_key = Key::new_crypto(CryptoKeypair::new_curve25519xchacha20poly1305(rng, &master_key).unwrap());
-        let transactions = transactions
+        let identity = identity
             .clone()
             .push_transaction(
-                transactions
+                identity
                     .create_identity(&HashAlgo::Blake3, now.clone(), vec![admin_key.clone()], vec![policy])
                     .unwrap()
                     .sign(&master_key, &admin_key)
                     .unwrap(),
             )
             .unwrap();
-        let transactions = transactions
+        let identity = identity
             .clone()
             .push_transaction(
-                transactions
+                identity
                     .add_subkey(&HashAlgo::Blake3, now.clone(), sign_key, "/stamp/sync/v1/sign", None)
                     .unwrap()
                     .sign(&master_key, &admin_key)
                     .unwrap(),
             )
             .unwrap();
-        let transactions = transactions
+        let identity = identity
             .clone()
             .push_transaction(
-                transactions
+                identity
                     .add_subkey(&HashAlgo::Blake3, now.clone(), crypto_key, "/stamp/sync/v1/crypto", None)
                     .unwrap()
                     .sign(&master_key, &admin_key)
                     .unwrap(),
             )
             .unwrap();
-        (master_key, transactions, admin_key)
+        (master_key, identity, admin_key)
     }
 
-    fn create_fake_identity<R: RngCore + CryptoRng>(rng: &mut R, now: Timestamp) -> (SecretKey, Transactions, AdminKey) {
+    fn create_fake_identity<R: RngCore + CryptoRng>(rng: &mut R, now: Timestamp) -> (SecretKey, Identity<Full>, AdminKey<Full>) {
         let master_key = SecretKey::new_xchacha20poly1305(rng).unwrap();
         create_fake_identity_with_master(rng, now, master_key)
     }
@@ -1916,7 +1917,7 @@ pub(crate) mod tests {
     }
 
     #[allow(dead_code)]
-    fn dump_tx(tx: &[(&'static str, &Transaction)]) {
+    fn dump_tx(tx: &[(&'static str, &Transaction<Public>)]) {
         let name_map = tx.iter().map(|(name, tx)| (tx.id().clone(), name)).collect::<HashMap<_, _>>();
         for (name, trans) in tx {
             #[allow(suspicious_double_ref_op)]
@@ -2127,15 +2128,15 @@ pub(crate) mod tests {
     }
 
     fn packet_body(
-        transactions: &Transactions,
+        identity: &Identity<Full>,
         now: Timestamp,
         previous_transactions: Vec<TransactionID>,
         topic_id: &TopicID,
         packet: &Packet,
-    ) -> Transaction {
+    ) -> Transaction<Full> {
         let packet_ser = packet.serialize_binary().unwrap();
         let topic_id_ser = topic_id.serialize_binary().unwrap();
-        transactions
+        identity
             .ext(
                 &HashAlgo::Blake3,
                 now,
@@ -2150,7 +2151,7 @@ pub(crate) mod tests {
     // TODO: rm and replace all instances with `Peer`
     struct PacketGen<'a, 'b, 'c> {
         rng: ChaCha20Rng,
-        transactions: &'a Transactions,
+        identity: &'a Identity<Full>,
         topic_id: &'b TopicID,
         topic_seckey: &'c SecretKey,
     }
@@ -2158,7 +2159,7 @@ pub(crate) mod tests {
     impl<'a, 'b, 'c> PacketGen<'a, 'b, 'c> {
         fn new<R: RngCore + CryptoRng>(
             rng: &mut R,
-            transactions: &'a Transactions,
+            identity: &'a Identity<Full>,
             topic_id: &'b TopicID,
             topic_seckey: &'c SecretKey,
         ) -> Self {
@@ -2167,17 +2168,17 @@ pub(crate) mod tests {
 
             Self {
                 rng: rng::chacha20_seeded(randbuf),
-                transactions,
+                identity,
                 topic_id,
                 topic_seckey,
             }
         }
 
-        fn tx(&self, now: Timestamp, prev: Vec<TransactionID>, packet: Packet) -> Transaction {
-            packet_body(self.transactions, now, prev, self.topic_id, &packet)
+        fn tx(&self, now: Timestamp, prev: Vec<TransactionID>, packet: Packet) -> Transaction<Full> {
+            packet_body(self.identity, now, prev, self.topic_id, &packet)
         }
 
-        fn tx_data(&mut self, now: Timestamp, prev: Vec<TransactionID>, id: &TransactionID, payload_plaintext: &[u8]) -> Transaction {
+        fn tx_data(&mut self, now: Timestamp, prev: Vec<TransactionID>, id: &TransactionID, payload_plaintext: &[u8]) -> Transaction<Full> {
             let packet = Packet::DataSet {
                 key_ref: id.clone(),
                 payload: self.topic_seckey.seal(&mut self.rng, payload_plaintext).unwrap(),
@@ -2194,9 +2195,11 @@ pub(crate) mod tests {
         topic: RefCell<Topic>,
         master_passphrase: &'static str,
         master_key: SecretKey,
-        identity: Transactions,
+        identity: Identity<Full>,
+        // not happy about duplicating this, but i need a place to store it. sue me.
+        identity_public: Identity<Public>,
         device: Device,
-        crypto_keys: Vec<CryptoKeypair>,
+        crypto_keys: Vec<CryptoKeypair<Full>>,
         key_packets: Vec<KeyPacket>,
     }
 
@@ -2222,20 +2225,22 @@ pub(crate) mod tests {
 
             let topic = Topic::new(topic_id.clone());
 
-            let (master_key, transactions, _admin_key) = create_fake_identity_with_master(
+            let (master_key, identity, _admin_key) = create_fake_identity_with_master(
                 &mut rng,
                 Timestamp::from_str("2024-01-01T00:00:06Z").unwrap(),
                 Self::passphrase_to_key(master_passphrase),
             );
 
             let device = Device::new(&mut rng, device_name.into());
+            let identity_public = identity.clone().into();
 
             let mut peer = Self {
                 rng,
                 topic: RefCell::new(topic),
                 master_passphrase,
                 master_key,
-                identity: transactions,
+                identity,
+                identity_public,
                 device,
                 crypto_keys: Vec::new(),
                 key_packets: Vec::new(),
@@ -2259,6 +2264,7 @@ pub(crate) mod tests {
                 master_passphrase: self.master_passphrase(),
                 master_key,
                 identity: self.identity.clone(),
+                identity_public: self.identity.clone().into(),
                 device,
                 crypto_keys: Vec::new(),
                 key_packets: Vec::new(),
@@ -2273,8 +2279,8 @@ pub(crate) mod tests {
 
         fn generate_key_packets(&mut self, num_keys: usize) {
             let master_key = self.master_key().clone();
-            let identity = self.identity().build_identity().unwrap();
-            let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap().key();
+            let identity_instance = self.identity().build_identity_instance().unwrap();
+            let admin_key = identity_instance.keychain().admin_key_by_name("Alpha").unwrap().key();
 
             let mut crypto_keys = (0..num_keys)
                 .map(|_| CryptoKeypair::new_curve25519xchacha20poly1305(self.rng_mut(), &master_key).unwrap())
@@ -2287,7 +2293,7 @@ pub(crate) mod tests {
                         &HashAlgo::Blake3,
                         ts("2005-07-26T21:00:00-0700"),
                         self.device().id(),
-                        &CryptoKeypairPublic::from(k.clone()),
+                        &CryptoKeypair::<Public>::from(k.clone()),
                     )
                     .unwrap();
                     packet.sign_mut(&master_key, &admin_key).unwrap();
@@ -2298,9 +2304,9 @@ pub(crate) mod tests {
             self.key_packets_mut().append(&mut key_packets);
         }
 
-        fn tx(&self, now: Timestamp, prev: Option<Vec<TransactionID>>, packet: Packet) -> Transaction {
-            let identity = self.identity().build_identity().unwrap();
-            let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap();
+        fn tx(&self, now: Timestamp, prev: Option<Vec<TransactionID>>, packet: Packet) -> Transaction<Full> {
+            let identity_instance = self.identity().build_identity_instance().unwrap();
+            let admin_key = identity_instance.keychain().admin_key_by_name("Alpha").unwrap();
             let transaction = self
                 .topic()
                 .transaction_from_packet(self.identity(), &HashAlgo::Blake3, prev, None::<[(&[u8], &[u8]); 0]>, now, &packet)
@@ -2314,7 +2320,7 @@ pub(crate) mod tests {
             payload: T,
             prev: Option<Vec<TransactionID>>,
             control_id: Option<TransactionID>,
-        ) -> Transaction {
+        ) -> Transaction<Full> {
             let payload_plaintext = payload.serialize_binary().unwrap();
             let topic_seckey = self.topic().current_secret_key().unwrap().unwrap();
             let control_id =
@@ -2326,11 +2332,10 @@ pub(crate) mod tests {
             self.tx(now, prev, packet)
         }
 
-        fn push_tx<T: Into<TopicTransaction> + Clone + std::fmt::Debug>(
-            &self,
-            identities: &HashMap<IdentityID, &Transactions>,
-            transactions: &[&T],
-        ) -> Result<TopicDagModificationResult> {
+        fn push_tx<T>(&self, identities: &HashMap<IdentityID, &Identity<Public>>, transactions: &[&T]) -> Result<TopicDagModificationResult>
+        where
+            T: Into<TopicTransaction> + Clone + std::fmt::Debug,
+        {
             #[allow(suspicious_double_ref_op)]
             let topic_tx = transactions.iter().map(|t| t.clone().clone().into()).collect::<Vec<_>>();
             let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
@@ -2358,8 +2363,8 @@ pub(crate) mod tests {
         }
 
         fn snapshot(&self, replaces: &TransactionID) -> Result<BTreeSet<TransactionID>> {
-            let identity = self.identity().build_identity().unwrap();
-            let admin_key = identity.keychain().admin_key_by_name("Alpha").unwrap().key();
+            let identity_instance = self.identity().build_identity_instance().unwrap();
+            let admin_key = identity_instance.keychain().admin_key_by_name("Alpha").unwrap().key();
             let fake_topic = Topic::new(TopicID::from_bytes([0; 16]));
             let mut topic = self.topic.replace(fake_topic);
             let res = match topic.snapshot(self.identity(), &HashAlgo::Blake3, ts("2028-04-13T06:07:08Z"), replaces) {
@@ -2423,11 +2428,11 @@ pub(crate) mod tests {
     fn create_1p_topic(
         topic_id: &TopicID,
         master_key: &SecretKey,
-        admin_key: &AdminKey,
-        identity: &Transactions,
-        crypto_key: &CryptoKeypair,
+        admin_key: &AdminKey<Full>,
+        identity: &Identity<Full>,
+        crypto_key: &CryptoKeypair<Full>,
         device_id: &DeviceID,
-        transactions: Vec<Transaction>,
+        transactions: Vec<Transaction<Full>>,
     ) -> Topic {
         let identity_id = identity.identity_id().unwrap();
         let transactions = transactions
@@ -2435,7 +2440,8 @@ pub(crate) mod tests {
             .map(|t| t.sign(master_key, admin_key).unwrap())
             .map(|t| TopicTransaction::new(t.try_into().unwrap()))
             .collect::<Vec<_>>();
-        let identity_map = HashMap::from([(identity.identity_id().unwrap(), identity)]);
+        let identity_pub = Identity::<Public>::from(identity.clone());
+        let identity_map = HashMap::from([(identity.identity_id().unwrap(), &identity_pub)]);
         Topic::new_from_transactions(topic_id.clone(), transactions, &identity_map, master_key, &[crypto_key], &identity_id, device_id)
             .unwrap()
     }
@@ -2454,7 +2460,7 @@ pub(crate) mod tests {
     }
 
     // creates a device_id -> crypto pubkey mapping
-    fn device_lookup(packets: &[&KeyPacket]) -> BTreeMap<DeviceID, CryptoKeypairPublic> {
+    fn device_lookup(packets: &[&KeyPacket]) -> BTreeMap<DeviceID, CryptoKeypair<Public>> {
         packets
             .iter()
             .map(|p| (p.get_device_id().unwrap(), p.get_pubkey().unwrap()))
@@ -2462,10 +2468,10 @@ pub(crate) mod tests {
     }
 
     // creates a lookup table for a set of peers
-    fn id_lookup<'a>(peers: &[&'a Peer]) -> HashMap<IdentityID, &'a Transactions> {
+    fn id_lookup<'a>(peers: &[&'a Peer]) -> HashMap<IdentityID, &'a Identity<Public>> {
         peers
             .iter()
-            .map(|p| (p.identity().identity_id().unwrap(), p.identity()))
+            .map(|p| (p.identity().identity_id().unwrap(), p.identity_public()))
             .collect::<HashMap<_, _>>()
     }
 
@@ -2482,7 +2488,7 @@ pub(crate) mod tests {
     macro_rules! rekey_args {
         ($member_def:expr) => {{
             let member_defs = $member_def;
-            let key_lookup: BTreeMap<DeviceID, CryptoKeypairPublic> = member_defs
+            let key_lookup: BTreeMap<DeviceID, CryptoKeypair<Public>> = member_defs
                 .iter()
                 .map(|(_, lookup)| lookup.into_iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>())
                 .flatten()
@@ -2511,17 +2517,18 @@ pub(crate) mod tests {
     #[test]
     fn topic_push_transaction() {
         let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"get a job").unwrap().as_bytes().try_into().unwrap());
-        let (master_key, transactions, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
+        let (master_key, identity, admin_key) = create_fake_identity(&mut rng, ts("2024-01-01T00:00:06Z"));
+        let identity_pub = Identity::<Public>::from(identity.clone());
         let node_a_sync_crypto = CryptoKeypair::new_curve25519xchacha20poly1305(&mut rng, &master_key).unwrap();
 
         let topic_id = TopicID::new(&mut rng);
         let topic_secret = TopicSecret::new(&mut rng);
         let topic_seckey = topic_secret.derive_secret_key().unwrap();
 
-        let mut pkt = PacketGen::new(&mut rng, &transactions, &topic_id, &topic_seckey);
+        let mut pkt = PacketGen::new(&mut rng, &identity, &topic_id, &topic_seckey);
 
         let member = Member::new(
-            transactions.identity_id().unwrap(),
+            identity.identity_id().unwrap(),
             vec![
                 Permission::DataSet,
                 Permission::DataUnset,
@@ -2566,14 +2573,14 @@ pub(crate) mod tests {
             topic_id
         );
 
-        let push = |topic: &mut Topic, tx: Vec<Transaction>| {
+        let push = |topic: &mut Topic, tx: Vec<Transaction<Full>>| {
             let txt = tx
                 .into_iter()
                 .map(|t| t.sign(&master_key, &admin_key).unwrap())
                 .map(|t| TopicTransaction::new(t.try_into().unwrap()))
                 .collect::<Vec<_>>();
-            let identity_id = transactions.identity_id().unwrap();
-            let identity_map = HashMap::from([(identity_id.clone(), &transactions)]);
+            let identity_id = identity.identity_id().unwrap();
+            let identity_map = HashMap::from([(identity_id.clone(), &identity_pub)]);
             topic.push_transactions_mut(txt, &identity_map, &master_key, &[&node_a_sync_crypto], &identity_id, member.devices()[0].id())
         };
         {
@@ -2611,8 +2618,8 @@ pub(crate) mod tests {
         .unwrap();
         packet.sign_mut(&master_key, admin_key.key()).unwrap();
 
-        let identity = transactions.build_identity().unwrap();
-        packet.verify(Some(&identity)).unwrap();
+        let identity_instance = Identity::<Public>::from(transactions.clone()).build_identity_instance().unwrap();
+        packet.authorize(Some(&identity_instance)).unwrap();
         assert_eq!(packet.get_pubkey().unwrap(), node_a_sync_crypto.clone().into());
     }
 
@@ -2670,7 +2677,7 @@ pub(crate) mod tests {
             &topic_id,
             &master_key,
             &admin_key,
-            &transactions,
+            &transactions.clone().into(),
             &node_a_sync_crypto,
             member.devices()[0].id(),
             topic_tx.clone(),
@@ -2690,7 +2697,7 @@ pub(crate) mod tests {
                 &topic_id,
                 &master_key,
                 &admin_key,
-                &transactions,
+                &transactions.clone().into(),
                 &node_a_sync_crypto,
                 member.devices()[0].id(),
                 topic_tx,
@@ -3278,8 +3285,8 @@ pub(crate) mod tests {
             topicdata!(dotty).unwrap(),
             vec![
                 AppData::new("hi i'm butch"),
-                AppData::new("oh, what's this????"),
                 AppData::new("nice knowing you"),
+                AppData::new("oh, what's this????"),
                 AppData::new("i'm not to be disturbed."),
             ]
         );
@@ -3304,8 +3311,8 @@ pub(crate) mod tests {
             topicdata!(dotty).unwrap(),
             vec![
                 AppData::new("hi i'm butch"),
-                AppData::new("oh, what's this????"),
                 AppData::new("nice knowing you"),
+                AppData::new("oh, what's this????"),
                 AppData::new("i'm not to be disturbed."),
                 AppData::new("wise and shine"),
             ]
@@ -3328,7 +3335,7 @@ pub(crate) mod tests {
                 .get_entry()
                 .unwrap()
                 .all_transactions(),
-            vec![&genesis, &rekey1, &data1, &data2, &rm1, &data4, &data3, &data5, &data6,]
+            vec![&genesis, &rekey1, &data1, &data2, &rm1, &data3, &data4, &data5, &data6]
                 .into_iter()
                 .map(|t| t.id())
                 .collect::<Vec<_>>()
@@ -3345,8 +3352,8 @@ pub(crate) mod tests {
             topicdata!(dotty).unwrap(),
             vec![
                 AppData::new("hi i'm butch"),
-                AppData::new("oh, what's this????"),
                 AppData::new("nice knowing you"),
+                AppData::new("oh, what's this????"),
                 AppData::new("i'm not to be disturbed."),
                 AppData::new("wise and shine"),
                 AppData::new("this way, please"),
@@ -3573,6 +3580,9 @@ pub(crate) mod tests {
     //
     // for now this only tests rm/data/snapshot transactions, not things like changing perms and
     // all that.
+    //
+    // NOTE that this test is resposible for finding more bugs in the protocol than all the other
+    // tests combined x10.
     #[test]
     fn topic_procedural_peer_channels() {
         /// Like `Peer`, but with channels
@@ -3591,14 +3601,17 @@ pub(crate) mod tests {
             }
 
             #[tracing::instrument(level = "info", skip_all, fields(%iter, peer = %&format!("{}", self.peer().identity().identity_id().unwrap())[0..8]))]
-            fn step<R: RngCore + CryptoRng + Clone>(
+            fn step<R>(
                 &mut self,
-                lookup: &HashMap<IdentityID, &Transactions>,
+                lookup: &HashMap<IdentityID, &Identity<Public>>,
                 keyserver: &mut HashMap<DeviceID, Vec<KeyPacket>>,
                 rng: &mut R,
                 timestamp: Timestamp,
                 iter: usize,
-            ) -> Result<Vec<(TopicTransaction, Option<AppData>)>> {
+            ) -> Result<Vec<(TopicTransaction, Option<AppData>)>>
+            where
+                R: RngCore + CryptoRng + Clone,
+            {
                 // first, process any incoming transactions
                 let mut incoming = Vec::new();
                 while let Ok(tx) = self.recv.try_recv() {

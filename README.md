@@ -3,7 +3,6 @@
 A topic-based intra-or-inter-identity data syncing system based on Stamp identities, with the goal of building
 shared datasets between multiple peers.
 
-
 A [`Topic`] is an object shared via message exchange by one or more peers that describes:
 
 - Who is a member of the topic
