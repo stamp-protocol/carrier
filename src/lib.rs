@@ -9,7 +9,7 @@ use stamp_core::{
         rng::{CryptoRng, RngCore},
         CryptoKeypair, Hash, HashAlgo, Sealed, SecretKey,
     },
-    dag::{Dag, DagNode, DagTamperUtil, ExtTransaction, Identity, Transaction, TransactionBody, TransactionID},
+    dag::{Dag, DagNode, DagTamperUtil, Ext, ExtTransaction, Identity, Transaction, TransactionBody, TransactionID},
     identity::IdentityID,
     private_parts::{Full, Public},
     util::{Binary, BinarySecret, BinaryVec, HashMapAsn1, SerdeBinary, Timestamp},
@@ -69,7 +69,7 @@ impl KeyPacket {
     /// Get this packet's `device_id` if possible (ie, if the underlying transaction is properly
     /// formed LOL ahaha XD XD)
     pub fn get_device_id(&self) -> Result<DeviceID> {
-        let context = self.get_context()?.as_ref().ok_or_else(|| Error::KeyPacketMalformed)?;
+        let context = self.get_ext()?.context();
         let device_id_bin = context
             .get(&BinaryVec::from(Vec::from(b"device_id")))
             .ok_or_else(|| Error::KeyPacketMalformed)?;
@@ -79,7 +79,7 @@ impl KeyPacket {
 
     /// Get this packet's pubkey
     pub fn get_pubkey(&self) -> Result<CryptoKeypair<Public>> {
-        let payload = self.get_payload()?;
+        let payload = self.get_ext()?.payload();
         let pubkey = CryptoKeypair::<Public>::deserialize_binary(&payload)?;
         Ok(pubkey)
     }
@@ -107,7 +107,7 @@ impl DerefMut for KeyPacket {
 impl SerdeBinary for KeyPacket {
     fn deserialize_binary(slice: &[u8]) -> stamp_core::error::Result<Self> {
         let tx = ExtTransaction::deserialize_binary(slice)?;
-        match tx.get_ty()? {
+        match tx.get_ext()?.ty() {
             Some(ty) => {
                 if ty.deref() != b"/stamp/sync/v1/keypacket" {
                     Err(stamp_core::error::Error::TransactionMismatch)?;
@@ -529,7 +529,7 @@ impl Snapshot {
 
     /// Get the [`SnapshotEntry`] from this entry.
     pub fn get_entry(&self) -> Result<SnapshotEntry> {
-        let payload = self.0.get_payload()?;
+        let payload = self.0.get_ext()?.payload();
         let entry = SnapshotEntry::deserialize_binary(payload.as_slice())?;
         Ok(entry)
     }
@@ -557,7 +557,7 @@ impl DerefMut for Snapshot {
 impl SerdeBinary for Snapshot {
     fn deserialize_binary(slice: &[u8]) -> stamp_core::error::Result<Self> {
         let tx = ExtTransaction::deserialize_binary(slice)?;
-        match tx.get_ty()? {
+        match tx.get_ext()?.ty() {
             Some(ty) => {
                 if ty.deref() != b"/stamp/sync/v1/snapshot" {
                     Err(stamp_core::error::Error::TransactionMismatch)?;
@@ -611,11 +611,9 @@ impl TopicTransaction {
         if self.is_empty() {
             Err(Error::TransactionIsEmpty(self.id().clone()))?;
         }
-        let context = self.transaction().get_context()?;
+        let context = self.transaction().get_ext()?.context();
         let key = BinaryVec::from(Vec::from(b"topic_id"));
         let topic_id_bin = context
-            .as_ref()
-            .ok_or_else(|| Error::TransactionMissingTopicID(self.id().clone()))?
             .get(&key)
             .ok_or_else(|| Error::TransactionMissingTopicID(self.id().clone()))?;
         let topic_id = TopicID::deserialize_binary(topic_id_bin.deref().as_slice())?;
@@ -627,21 +625,21 @@ impl TopicTransaction {
         if self.is_empty() {
             Err(Error::TransactionIsEmpty(self.id().clone()))?;
         }
-        let payload = self.transaction().get_payload()?;
+        let payload = self.transaction().get_ext()?.payload();
         let packet = Packet::deserialize_binary(payload.deref())?;
         Ok(packet)
     }
 
     /// Returns the identity id of this transaction.
     pub fn identity_id(&self) -> Result<&IdentityID> {
-        Ok(self.transaction().get_creator()?)
+        Ok(self.transaction().get_ext()?.creator())
     }
 
     /// Return the transactions that came before this one within the topic DAG. In other words, we
     /// don't use `transaction.entry().previous_transactions()` but rather
     /// `transaction.entry().body::<ExtV1>().previous_transactions()`.
     pub fn previous_transactions(&self) -> Result<Vec<&TransactionID>> {
-        let prev = self.transaction().get_previous_transactions()?;
+        let prev = self.transaction().get_ext()?.previous_transactions();
         Ok(prev.iter().collect::<Vec<_>>())
     }
 
@@ -679,7 +677,7 @@ impl TopicTransaction {
     /// Get the raw (serialized) payload for this transaction if it exists.
     pub fn get_payload(&self) -> Option<&BinaryVec> {
         match self.transaction().entry().body() {
-            TransactionBody::ExtV1 { payload, .. } => Some(payload),
+            TransactionBody::ExtV1(ext) => Some(ext.payload()),
             _ => None,
         }
     }
@@ -690,7 +688,7 @@ impl TopicTransaction {
     /// them.
     pub fn is_empty(&self) -> bool {
         match self.transaction().entry().body() {
-            TransactionBody::ExtV1 { payload, .. } => payload.len() == 0,
+            TransactionBody::ExtV1(ext) => ext.payload().len() == 0,
             // we're going to lump anything non-ExtV1 into the "is blank" bucket. sue me.
             _ => true,
         }
@@ -1521,14 +1519,14 @@ impl Topic {
                     tx_id.clone(),
                     timestamp.clone(),
                     vec![],
-                    TransactionBody::ExtV1 {
-                        creator: TransactionID::from(Hash::new_blake3_from_bytes([0u8; 32])).into(),
-                        ty: None,
+                    TransactionBody::ExtV1(Ext::new(
+                        TransactionID::from(Hash::new_blake3_from_bytes([0u8; 32])).into(),
+                        None,
                         // we set this a bit later
-                        previous_transactions: vec![],
-                        context: None,
-                        payload: Vec::new().into(),
-                    },
+                        vec![],
+                        Default::default(),
+                        Vec::new().into(),
+                    )),
                 );
                 let topic_trans = TopicTransaction {
                     transaction: trans.try_into()?,
@@ -3208,7 +3206,7 @@ pub(crate) mod tests {
 
     #[test]
     fn topic_dag_rebuild_with_snapshot() {
-        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe...?").unwrap().as_bytes().try_into().unwrap());
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"dupe dupe...??").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dogphone");
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "butch6969", "laptop");
@@ -4748,7 +4746,7 @@ pub(crate) mod tests {
     // the DAG but doesn't try to actually read the empty packet data.
     #[test]
     fn topic_branch_merge_branch_rm() {
-        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATSz").unwrap().as_bytes().try_into().unwrap());
+        let mut rng = rng::chacha20_seeded(Hash::new_blake3(b"GOATS").unwrap().as_bytes().try_into().unwrap());
         let topic_id = TopicID::new(&mut rng);
         let mut butch = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "butch");
         let mut dotty = Peer::new_identity(&mut rng, &topic_id, "dupedupe123", "dotty");

@@ -1,12 +1,13 @@
 [package]
 name = "carrier"
 version = "0.1.0"
+authors = ["Kay Danger Lyon <kay@killtheradio.net>"]
 edition = "2021"
 
 [dependencies]
 chrono = "0.4"
 getset = "0.1"
-rasn = "0.28.3"
+rasn = "0.28.7"
 stamp-core = { path = "../core" }
 thiserror = "1.0"
 tracing = { version = "0.1", features = ["log"] }
